@@ -21,18 +21,25 @@ concurrency:
   group: daily-pipeline
   cancel-in-progress: false
 
+# Optional repo Variables (Settings -> Secrets and variables -> Actions -> Variables).
+# Empty/unset values fall back to the defaults inside pipeline.py.
 env:
   DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '0' }}
   TOPIC: ${{ github.event.inputs.topic }}
   NICHE: ${{ vars.NICHE }}
+  LANGUAGE: ${{ vars.LANGUAGE }}              # e.g. Hinglish
+  HINGLISH_MODE: ${{ vars.HINGLISH_MODE }}    # devanagari (default) | roman
   VOICE: ${{ vars.VOICE }}
-  LANGUAGE: ${{ vars.LANGUAGE }}          # e.g. Hinglish
-  HINGLISH_MODE: ${{ vars.HINGLISH_MODE }}  # devanagari (default) | roman
+  LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}      # default: https://api.groq.com/openai/v1
+  LLM_MODEL: ${{ vars.LLM_MODEL }}            # default: openai/gpt-oss-120b
+  LLM_FAST_MODEL: ${{ vars.LLM_FAST_MODEL }}  # default: openai/gpt-oss-20b
+  LLM_TPM: ${{ vars.LLM_TPM }}                # your tokens-per-minute budget (default 7500)
+  WRITE_PARTS: ${{ vars.WRITE_PARTS }}        # 2 = plan + 2 write calls; use 3-4 if you hit 413/429
 
 jobs:
   prepare:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60   # TPM pacing can add several minutes of waiting
     steps:
       - uses: actions/checkout@v4
 
@@ -53,11 +60,22 @@ jobs:
       - name: Install Python deps
         run: pip install -r requirements.txt
 
+      - name: Check LLM access (fail fast on bad key / unreachable endpoint)
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          BASE="${LLM_BASE_URL:-https://api.groq.com/openai/v1}"
+          WANT="${LLM_MODEL:-openai/gpt-oss-120b}"
+          IDS=$(curl -fsS "$BASE/models" -H "Authorization: Bearer $GROQ_API_KEY" \
+            | python3 -c "import sys,json; print('\n'.join(m['id'] for m in json.load(sys.stdin)['data']))" 2>/dev/null) \
+            || { echo "::error::Could not list models - check GROQ_API_KEY / LLM_BASE_URL"; exit 1; }
+          echo "Models available to this key:"; echo "$IDS"
+          echo "$IDS" | grep -qx "$WANT" || echo "::warning::$WANT is not in your model list; pipeline will try its fallbacks"
+
       - name: Topic -> script -> voice -> images
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
-          PEXELS_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
         run: python pipeline.py prepare
 
       - uses: actions/upload-artifact@v4
@@ -93,7 +111,7 @@ jobs:
           name: build
           path: build
 
-      - name: Render ${{ matrix.target }}
+      - name: Render ${{ matrix.target }} (+ thumbnail)
         run: python pipeline.py render --target ${{ matrix.target }}
 
       - uses: actions/upload-artifact@v4
