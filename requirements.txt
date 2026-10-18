@@ -1,10 +1,11 @@
-groq>=0.9.0
-edge-tts>=6.1.19
-Pillow>=10.0.0
-requests>=2.31.0
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.2.0
 sentence-transformers>=3.0.0
 numpy>=1.24.0
+edge-tts>=6.1.19
 tenacity>=8.2.0
+requests>=2.31.0
+Pillow>=10.0.0
 google-api-python-client>=2.100.0
 google-auth>=2.23.0
 google-auth-oauthlib>=1.1.0
