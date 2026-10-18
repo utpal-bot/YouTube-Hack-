@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Daily documentary pipeline.
+Daily documentary pipeline (Groq + Pixabay + Edge-TTS).
 
   python pipeline.py prepare                  # topic -> script -> voice -> images   (build/)
   python pipeline.py render --target long     # 1920x1080 long video + thumbnail     (out/long.mp4)
@@ -30,9 +30,9 @@ def env(name: str, default: str) -> str:
     return os.getenv(name) or default
 
 
-# LLM Models via Groq
+# Both set to the verified active Groq model
 MODEL = env("GROQ_MODEL", "llama-3.3-70b-versatile")
-FAST_MODEL = env("GROQ_FAST_MODEL", "llama-3.1-8b-instant")
+FAST_MODEL = env("GROQ_FAST_MODEL", "llama-3.3-70b-versatile")
 NICHE = env("NICHE", "mysteries of technology, science and the human mind")
 LANGUAGE = env("LANGUAGE", "English")
 
@@ -152,7 +152,6 @@ def probe_duration(path) -> float:
 
 
 def claude(model: str, system: str, user: str, max_tokens: int) -> str:
-    """Uses Groq API for LLM generation."""
     from groq import Groq
 
     api_key = os.getenv("GROQ_API_KEY")
