@@ -2,10 +2,26 @@
 """
 Daily documentary pipeline.
 
-  python pipeline.py prepare                  # topic -> script -> voice -> images   (build/)
+  python pipeline.py prepare                  # topic -> script -> voice -> visuals   (build/)
   python pipeline.py render --target long     # 1920x1080 long video + thumbnail     (out/long.mp4)
   python pipeline.py render --target short1   # 1080x1920 Shorts: short1..short3     (out/shortN.mp4)
   python pipeline.py voicetest                # sample Hinglish clips for every voice option (out/)
+
+LLM: any OpenAI-compatible endpoint (default: Groq free tier, openai/gpt-oss-*). Script generation is
+CHUNKED (1 plan call + WRITE_PARTS write calls + small transliteration batches) and paced by a
+tokens-per-minute limiter (LLM_TPM), so the free-tier limits are never exceeded.
+Visuals: Pexels photos + B-roll video -> Wikimedia Commons -> Unsplash (optional) -> procedural animated background.
+
+Design: audio-first timeline. Every scene's length = its TTS audio length, so visuals and
+narration can never drift. Scenes are rendered one by one with FFmpeg (low RAM), concatenated
+with stream copy, then captions + music + SFX are mixed/burned in ONE final pass.
+
+SFX tags (per scene, from the script's "sfx" list), files looked up in assets/sfx/:
+  riser   -> ENDS exactly at the scene's cut (builds into the next scene)
+  braam   -> HITS at the scene's first frame (the reveal)
+  glitch  -> short digital burst at the scene's first frame
+  silence -> the scene gets extra tail pause and the background music is muted for that tail
+Missing files are synthesised with FFmpeg as a fallback, so the pipeline never breaks.
 """
 import argparse
 import asyncio
@@ -21,27 +37,32 @@ from pathlib import Path
 import dedupe
 
 BUILD, OUT, TMP = Path("build"), Path("out"), Path("tmp")
-AUDIO, IMG = BUILD / "audio", BUILD / "img"
-MUSIC = Path("assets/music.mp3")
-SFX_DIR = Path("assets/sfx")
+AUDIO, IMG, VID = BUILD / "audio", BUILD / "img", BUILD / "vid"
+MUSIC = Path("assets/music.mp3")  # optional background music (you must own the license)
+SFX_DIR = Path("assets/sfx")      # riser*.wav, braam*.wav, glitch*.wav (variants rotate: riser_1, riser_2 ...)
 
 
 def env(name: str, default: str) -> str:
-    return os.getenv(name) or default
+    return os.getenv(name) or default  # treats empty string (unset GH var) as default
 
 
-# ---- LLM Configuration ----
+# ---- LLM (OpenAI-compatible; Groq by default) ----
 LLM_BASE = env("LLM_BASE_URL", "https://api.groq.com/openai/v1")
 LLM_KEY = os.getenv("GROQ_API_KEY") or os.getenv("LLM_API_KEY") or ""
-MODEL = env("LLM_MODEL", "openai/gpt-oss-120b")
-FAST_MODEL = env("LLM_FAST_MODEL", "openai/gpt-oss-20b")
-FALLBACKS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
-LLM_TPM = int(env("LLM_TPM", "7500"))
-WRITE_PARTS = int(env("WRITE_PARTS", "2"))
+MODEL = env("LLM_MODEL", "openai/gpt-oss-120b")        # script writing
+FAST_MODEL = env("LLM_FAST_MODEL", "openai/gpt-oss-20b")  # topics, judge, transliteration
+FALLBACKS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]  # tried in order on 404 / decommissioned
+LLM_TPM = int(env("LLM_TPM", "7500"))          # your tokens-per-minute budget (free tier is small; check console)
+WRITE_PARTS = int(env("WRITE_PARTS", "2"))     # 2 => plan + 2 write calls = the "3-call" script
 TRANSLIT_BATCH = int(env("TRANSLIT_BATCH", "10"))
 NICHE = env("NICHE", "mysteries of technology, science and the human mind")
 LANGUAGE = env("LANGUAGE", "English")
 
+# ---- Hinglish handling ------------------------------------------------------
+# Hindi neural voices stumble on Roman-script Hinglish. Fix: the LLM writes every scene twice:
+#   narration -> Roman Hinglish (used for captions)       tts_text -> Devanagari, word-for-word (used for the voice)
+# Caption timing is mapped 1:1 from the Devanagari words. HINGLISH_MODE=roman skips this and
+# reads Roman text with an Indian-English voice instead.
 IS_HINGLISH = "hinglish" in LANGUAGE.lower()
 USE_DEVA = IS_HINGLISH and env("HINGLISH_MODE", "devanagari").lower() != "roman"
 if IS_HINGLISH:
@@ -56,9 +77,9 @@ LANG_DESC = (
 )
 
 FPS = int(env("FPS", "30"))
-PAD = 0.25
-SILENCE_EXTRA = 0.6
-BORDERLINE = 0.65
+PAD = 0.25            # seconds of breathing room after each scene
+SILENCE_EXTRA = 0.6   # extra pause appended to scenes tagged "silence"
+BORDERLINE = 0.65     # similarity band where an LLM judge double-checks topics
 
 MUSIC_GAIN = float(env("MUSIC_GAIN", "0.12"))
 SFX_GAIN = {
@@ -66,8 +87,13 @@ SFX_GAIN = {
     "braam": float(env("SFX_GAIN_BRAAM", "0.7")),
     "glitch": float(env("SFX_GAIN_GLITCH", "0.5")),
 }
-SFX_CAPS = {"riser": 6, "braam": 4, "glitch": 5, "silence": 4}
+SFX_CAPS = {"riser": 6, "braam": 4, "glitch": 5, "silence": 4}  # per video, keeps effects meaningful
 SFX_EXT = (".wav", ".mp3", ".ogg", ".flac", ".m4a")
+
+VISUAL_PROVIDERS = env("VISUAL_PROVIDERS", "pexels,wikimedia,unsplash")  # Pixabay intentionally not used
+BROLL_EVERY = int(env("BROLL_EVERY", "3"))      # every Nth scene tries a Pexels B-roll video first (0 = never)
+MOTION_BLUR = env("MOTION_BLUR", "1") == "1"    # subtle 3-frame blend on Ken Burns shots
+WIKI_CONTACT = env("WIKI_CONTACT", "https://github.com")  # Wikimedia asks for contact info in User-Agent
 
 TARGETS = {
     "long": (1920, 1080),
@@ -76,6 +102,9 @@ TARGETS = {
     "short3": (1080, 1920),
 }
 
+# --------------------------------------------------------------------------- #
+# Prompts
+# --------------------------------------------------------------------------- #
 TOPIC_SYSTEM = (
     "You pick fresh topics for a documentary-style faceless YouTube channel. "
     "Return ONLY JSON. Topics must be specific, intriguing and clearly different "
@@ -101,6 +130,13 @@ SFX: "sfx" is a list using ONLY these tags: riser, braam, silence, glitch (use [
 - silence: on the beat right before the single biggest reveal (music drops out). Max 4.
 - glitch: on unsettling / tension moments. Max 5.
 
+VISUAL QUERIES ("visual_query" = a stock-photo search, 2-3 words):
+- Concrete and filmable only. Show what a camera can see: a place, an object, a person doing something, light, texture.
+- Never abstract concepts. BAD: "quantum entanglement", "future of AI", "human mind".
+  GOOD: "neon fiber optic", "observatory telescope night", "macro circuit board".
+- Subject + setting or light works best. Do not repeat the same subject in consecutive beats.
+- No names, brands, logos, text, or quotes inside a query.
+
 OUTPUT: ONLY valid JSON (no markdown fences):
 {
   "title": "<= 70 chars, curiosity-driven, NOT misleading",
@@ -113,7 +149,7 @@ OUTPUT: ONLY valid JSON (no markdown fences):
   "beats": [
     {"id": 1, "section": "cold_open|past|present|future|resolution",
      "beat": "max 18 words: what this scene says",
-     "visual_query": "2-4 word stock photo search", "sfx": ["riser"]}
+     "visual_query": "2-3 concrete visual words", "sfx": ["riser"]}
   ],
   "shorts": [
     {"title": "...", "hook": "max 8 words, shown on screen in first 3 seconds",
@@ -133,6 +169,9 @@ Return ONLY JSON (no markdown): {"scenes":[{"id":N,"narration":"..."}]} - exactl
 """.replace("__LANG__", LANG_DESC)
 
 
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
 def sh(cmd):
     cmd = [str(c) for c in cmd]
     print("$", " ".join(cmd[:8]), "...", flush=True)
@@ -148,10 +187,11 @@ def probe_duration(path) -> float:
     return float(out.strip())
 
 
-_window = []
+_window = []  # (timestamp, tokens) used in the last 60 s
 
 
 def _budget_wait(est: int):
+    """Block until `est` more tokens fit into the LLM_TPM budget of the rolling 60 s window."""
     while True:
         now = time.time()
         while _window and now - _window[0][0] >= 60:
@@ -165,6 +205,8 @@ def _budget_wait(est: int):
 
 
 def claude(model: str, system: str, user: str, max_tokens: int) -> str:
+    """Chat completion on any OpenAI-compatible endpoint (name kept so nothing else changes).
+    Features: TPM pacing, 429 retry-after, model fallback on 404/decommissioned."""
     import requests
 
     if not LLM_KEY:
@@ -179,7 +221,7 @@ def claude(model: str, system: str, user: str, max_tokens: int) -> str:
                 "model": m,
                 "messages": [{"role": "system", "content": system},
                              {"role": "user", "content": user}],
-                "max_tokens": max_tokens,
+                "max_tokens": max_tokens,  # for gpt-oss this ALSO covers hidden reasoning tokens
                 "temperature": 0.7,
             }
             if "gpt-oss" in m:
@@ -193,7 +235,7 @@ def claude(model: str, system: str, user: str, max_tokens: int) -> str:
             if r.status_code == 429:
                 wait = float(r.headers.get("retry-after") or 10 * (attempt + 1))
                 print(f"  429 rate limited, sleeping {wait:.0f}s", flush=True)
-                _window.append((time.time(), LLM_TPM))
+                _window.append((time.time(), LLM_TPM))  # assume the minute is spent
                 time.sleep(wait)
                 continue
             if r.status_code == 413:
@@ -214,7 +256,7 @@ def parse_json(text: str) -> dict:
 def claude_json(model, system, user, max_tokens, tries=3) -> dict:
     last = None
     for i in range(tries):
-        try:
+        try:  # on retry give the model more room (truncated JSON / reasoning ate the budget)
             return parse_json(claude(model, system, user, int(max_tokens * (1 + 0.3 * i))))
         except SystemExit:
             raise
@@ -225,6 +267,9 @@ def claude_json(model, system, user, max_tokens, tries=3) -> dict:
     raise RuntimeError(f"LLM JSON failed after {tries} tries: {last}")
 
 
+# --------------------------------------------------------------------------- #
+# Topic + script
+# --------------------------------------------------------------------------- #
 def judge_same(a: str, b: str) -> bool:
     out = claude_json(
         FAST_MODEL, "Answer ONLY JSON.",
@@ -255,6 +300,7 @@ def choose_topic(db: dict):
 
 
 def parse_sfx(value) -> list:
+    """Accepts ["riser","braam"], "riser, braam" or "[SFX: riser]" and returns known tags."""
     text = " ".join(value) if isinstance(value, (list, tuple)) else str(value or "")
     return [n for n in ("riser", "braam", "glitch", "silence") if re.search(rf"\b{n}\b", text, re.I)]
 
@@ -263,7 +309,7 @@ def cap_sfx(scenes):
     counts = {}
     for s in scenes:
         if "silence" in s["sfx"] and "riser" in s["sfx"]:
-            s["sfx"].remove("riser")
+            s["sfx"].remove("riser")  # silence scene = music drops; a riser would fight it
         keep = []
         for tag in s["sfx"]:
             if counts.get(tag, 0) < SFX_CAPS[tag]:
@@ -273,6 +319,7 @@ def cap_sfx(scenes):
 
 
 def fill_tts_text(scenes):
+    """Devanagari twin for every scene (batched to stay far below the TPM budget)."""
     missing = [s for s in scenes if not (s.get("tts_text") or "").strip()]
     for i in range(0, len(missing), TRANSLIT_BATCH):
         batch = missing[i:i + TRANSLIT_BATCH]
@@ -292,7 +339,7 @@ def fill_tts_text(scenes):
             except (KeyError, TypeError, ValueError):
                 continue
         for s in batch:
-            s["tts_text"] = mapping.get(s["id"]) or s["narration"]
+            s["tts_text"] = mapping.get(s["id"]) or s["narration"]  # last resort: Roman text
 
 
 def outline_text(beats) -> str:
@@ -305,8 +352,9 @@ def split_ids(n: int, parts: int):
 
 
 def write_part(plan: dict, beats: list, ids: list, tail: str) -> dict:
+    """One narration call for the given beat ids. Returns {id: narration}."""
     got = {}
-    for _ in range(2):
+    for _ in range(2):  # second pass only asks for what is still missing
         want = [i for i in ids if i not in got]
         if not want:
             break
@@ -329,6 +377,7 @@ def write_part(plan: dict, beats: list, ids: list, tail: str) -> dict:
 
 
 def generate_script(topic: str, angle: str) -> dict:
+    """Chunked script: 1 PLAN call, WRITE_PARTS narration calls, then small transliteration batches."""
     plan = claude_json(
         MODEL, PLAN_GUIDE,
         f"Topic: {topic}\nAngle: {angle or 'your choice'}\nPlan the video now.", max_tokens=4500,
@@ -337,7 +386,7 @@ def generate_script(topic: str, angle: str) -> dict:
     if len(beats) < 10:
         raise RuntimeError(f"Plan too short: {len(beats)} beats")
 
-    idmap = {}
+    idmap = {}  # renumber beats 1..n and remap every reference
     for new, b in enumerate(beats, 1):
         try:
             idmap[int(b.get("id", new))] = new
@@ -346,7 +395,8 @@ def generate_script(topic: str, angle: str) -> dict:
         b["id"] = new
         b["section"] = b.get("section") or "present"
         b["beat"] = (b.get("beat") or "").strip()
-        b["visual_query"] = b.get("visual_query") or "dark abstract technology"
+        vq = " ".join(str(b.get("visual_query") or "").split()[:3])  # keep stock searches short
+        b["visual_query"] = vq or "night city lights"
         b["sfx"] = parse_sfx(b.get("sfx"))
     n = len(beats)
     narr, tail = {}, ""
@@ -380,7 +430,7 @@ def generate_script(topic: str, angle: str) -> dict:
                 j = None
             if j in ids:
                 sid.append(j)
-        if not sid:
+        if not sid:  # fallback: 4 consecutive scenes spread across the video
             start = min(k * (n // 3) + 1, max(1, n - 3))
             sid = list(range(start, min(start + 4, n + 1)))
         fixed.append({
@@ -406,8 +456,12 @@ def generate_script(topic: str, angle: str) -> dict:
     }
 
 
+# --------------------------------------------------------------------------- #
+# Voice (edge-tts) + word timings
+# --------------------------------------------------------------------------- #
 def spread_words(marks, text: str, dur: float):
-    if not marks:
+    """Turn boundary events (word- or sentence-level) into per-word [start, end, word]."""
+    if not marks:  # fallback: spread evenly by character length
         marks = [(0.0, dur, text)]
     out = []
     for off, d, t in marks:
@@ -424,6 +478,8 @@ def spread_words(marks, text: str, dur: float):
 
 
 def retarget_words(spoken, caption_text: str):
+    """Map timings of the spoken (Devanagari) words onto the caption (Roman) words.
+    1:1 when the word counts match, proportional by index otherwise."""
     cw = caption_text.split()
     if not spoken or not cw:
         return spoken
@@ -440,6 +496,7 @@ def retarget_words(spoken, caption_text: str):
 
 
 async def synth_voice(text: str, path: Path, voice: str, rate: str):
+    """Write mp3 to `path`, return boundary marks [(start, dur, text)]."""
     import edge_tts
     from tenacity import retry, stop_after_attempt, wait_exponential
 
@@ -447,7 +504,7 @@ async def synth_voice(text: str, path: Path, voice: str, rate: str):
     async def run():
         try:
             comm = edge_tts.Communicate(text, voice, rate=rate, boundary="WordBoundary")
-        except TypeError:
+        except TypeError:  # older edge-tts without `boundary`
             comm = edge_tts.Communicate(text, voice, rate=rate)
         marks = []
         with open(path, "wb") as f:
@@ -486,6 +543,7 @@ async def tts_all(scenes):
 
 
 def cmd_voicetest():
+    """Generate comparison clips so you can LISTEN and pick the best Hinglish voice."""
     OUT.mkdir(exist_ok=True)
     roman = "Socho agar ek din tumhara dimaag khud sochna band kar de, aur tumhe pata bhi na chale."
     deva = "सोचो अगर एक दिन तुम्हारा दिमाग खुद सोचना बंद कर दे, और तुम्हें पता भी न चले।"
@@ -503,16 +561,14 @@ def cmd_voicetest():
             print("wrote", OUT / f"voicetest_{name}.mp3")
 
     asyncio.run(run())
-    print("Listen to A/B vs C/D. Set VOICE and HINGLISH_MODE accordingly.")
+    print("Listen to A/B (Devanagari mode) vs C/D (roman mode). Set VOICE and HINGLISH_MODE accordingly.")
 
 
 # --------------------------------------------------------------------------- #
-# Images (Robust Pixabay Fetcher + Ladder of Fallbacks)
+# Visuals: Pexels (HD photos + B-roll video) -> Wikimedia Commons (no key)
+#          -> Unsplash (optional) -> procedural animated background (always available)
 # --------------------------------------------------------------------------- #
-PIX_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    "Referer": "https://pixabay.com/",
-}
+UA = "yt-documentary-pipeline/2.0 (visual fetcher; see repo for contact)"
 GENERIC_QUERIES = [
     "abstract technology", "futuristic technology", "space galaxy", "science laboratory",
     "neural network", "digital data", "night city lights", "abstract light",
@@ -527,10 +583,24 @@ SECTION_QUERIES = {
 }
 STOPWORDS = {"the", "and", "that", "with", "from", "this", "what", "your", "into", "will", "have", "about",
              "when", "they", "them", "than", "then", "which", "while", "there", "their", "here", "just"}
-_pix = {"calls": [], "cache": {}, "disabled": None, "warned_nokey": False}
+
+KEY_ENV = {"pexels": "PEXELS_API_KEY", "unsplash": "UNSPLASH_ACCESS_KEY"}  # wikimedia needs no key
+# provider -> (max calls, window in seconds); kept below each free tier
+LIMITS = {"pexels": (190, 3600), "unsplash": (45, 3600), "wikimedia": (50, 60)}
+_prov = {n: {"calls": [], "cache": {}, "disabled": None, "key": None} for n in LIMITS}
+
+
+def clean_key(name: str) -> str:
+    """Secrets pasted from a phone can carry a newline, spaces or quotes. Strip them. Never prints the key."""
+    raw = os.getenv(name) or ""
+    key = "".join(raw.strip().strip("\"'").split())
+    if raw and key != raw:
+        print(f"  note: {name} had whitespace/quotes ({len(raw)} -> {len(key)} chars); cleaned", flush=True)
+    return key
 
 
 def topic_queries(script: dict, topic: str = "") -> list:
+    """Search terms taken from the video's own title/topic (used when a scene's query finds nothing)."""
     words = [w for w in re.findall(r"[a-z]{4,}", f"{script.get('title', '')} {topic}".lower()) if w not in STOPWORDS]
     uniq = list(dict.fromkeys(words))
     out = []
@@ -541,119 +611,349 @@ def topic_queries(script: dict, topic: str = "") -> list:
     return out + uniq[:2]
 
 
-def _pix_throttle():
-    now = time.time()
-    _pix["calls"] = [t for t in _pix["calls"] if now - t < 60]
-    if len(_pix["calls"]) >= 85:
-        time.sleep(max(1.0, 60 - (now - _pix["calls"][0]) + 0.5))
-    _pix["calls"].append(time.time())
+def _allow_call(name: str) -> bool:
+    maxn, window = LIMITS[name]
+    st, now = _prov[name], time.time()
+    st["calls"] = [t for t in st["calls"] if now - t < window]
+    if len(st["calls"]) >= maxn:
+        if window <= 60:
+            time.sleep(max(1.0, window - (now - st["calls"][0]) + 0.5))
+        else:
+            st["disabled"] = f"quota reached ({maxn}/{window}s) for this run"
+            print(f"  {name}: {st['disabled']} -> next provider", flush=True)
+            return False
+    st["calls"].append(time.time())
+    return True
 
 
-def pixabay_search(key: str, query: str, strict: bool = True) -> list:
+def _api_get(name: str, url: str, **kw):
+    """GET with throttling. Auth/quota failures disable the provider for the rest of the run."""
     import requests
 
-    ck = (query, strict)
-    if ck in _pix["cache"]:
-        return _pix["cache"][ck]
-    params = {"key": key, "q": query[:100], "safesearch": "true", "per_page": 30}
-    if strict:
-        params.update({"image_type": "photo", "orientation": "horizontal", "min_width": 1280})
+    st = _prov[name]
     for attempt in range(3):
-        _pix_throttle()
-        r = requests.get("https://pixabay.com/api/", params=params, headers=PIX_HEADERS, timeout=30)
+        if not _allow_call(name):
+            return None
+        r = requests.get(url, timeout=30, **kw)
         if r.status_code == 429:
-            print(f"  pixabay 429, sleeping {20 * (attempt + 1)}s", flush=True)
+            if LIMITS[name][1] > 60:
+                st["disabled"] = "HTTP 429 rate limited"
+                print(f"  {name}: {st['disabled']} -> next provider", flush=True)
+                return None
             time.sleep(20 * (attempt + 1))
             continue
         if r.status_code in (400, 401, 403):
-            _pix["disabled"] = f"HTTP {r.status_code}: {r.text[:150]}"
-            print(f"  PIXABAY ERROR -> {_pix['disabled']}", flush=True)
-            return []
+            st["disabled"] = f"HTTP {r.status_code}: {r.text[:120].strip()}"
+            print(f"  {name.upper()} REQUEST ERROR -> {st['disabled']}", flush=True)
+            return None
         r.raise_for_status()
-        hits = r.json().get("hits", [])
-        _pix["cache"][ck] = hits
-        return hits
-    return []
+        return r
+    return None
 
 
-def _download_image(hit: dict, dst: Path) -> bool:
+def _pick_video_file(files: list):
+    """Best landscape MP4 between 1280 and 2560 px wide, closest to 1080p (keeps downloads sane)."""
+    ok = [f for f in files
+          if str(f.get("file_type", "")).startswith("video/mp4")
+          and 1280 <= int(f.get("width") or 0) <= 2560
+          and int(f.get("width") or 0) > int(f.get("height") or 1)]
+    return min(ok, key=lambda f: abs(int(f["width"]) - 1920)) if ok else None
+
+
+# ---- search functions: each returns a list of candidates {kind, id, urls, credit, ...} ----
+def search_pexels_photos(key: str, query: str) -> list:
+    """Pexels photo search. Endpoint https://api.pexels.com/v1/search, raw key in Authorization (no 'Bearer')."""
+    r = _api_get("pexels", "https://api.pexels.com/v1/search",
+                 params={"query": query[:100], "orientation": "landscape", "per_page": 15},
+                 headers={"Authorization": key, "User-Agent": UA})
+    out = []
+    for p in (r.json().get("photos", []) if r else []):
+        src = p.get("src") or {}
+        if not src.get("original"):
+            continue
+        out.append({
+            "kind": "image", "id": f"pexp:{p['id']}",
+            "urls": [src["original"] + "?auto=compress&cs=tinysrgb&w=2560", src["original"], src.get("large2x")],
+            "credit": f"Photo by {p.get('photographer') or 'unknown'} on Pexels",
+        })
+    return out
+
+
+def search_pexels_videos(key: str, query: str) -> list:
+    """Pexels B-roll video search. Endpoint https://api.pexels.com/videos/search."""
+    r = _api_get("pexels", "https://api.pexels.com/videos/search",
+                 params={"query": query[:100], "orientation": "landscape", "per_page": 15},
+                 headers={"Authorization": key, "User-Agent": UA})
+    out = []
+    for v in (r.json().get("videos", []) if r else []):
+        if (v.get("duration") or 0) < 6:
+            continue
+        f = _pick_video_file(v.get("video_files") or [])
+        if not f:
+            continue
+        out.append({
+            "kind": "video", "id": f"pexv:{v['id']}", "urls": [f["link"]],
+            "credit": f"Video by {(v.get('user') or {}).get('name') or 'unknown'} on Pexels",
+        })
+    return out
+
+
+def search_wikimedia(_key: str, query: str) -> list:
+    """Wikimedia Commons (public domain / CC archival imagery). No API key. Keeps only JPEG/PNG >= 1280 px wide."""
     import requests
-    from PIL import Image
-    from io import BytesIO
 
-    for url in (hit.get("fullHDURL"), hit.get("largeImageURL"), hit.get("webformatURL")):
+    if not _allow_call("wikimedia"):
+        return []
+    params = {
+        "action": "query", "format": "json", "generator": "search", "gsrnamespace": 6,
+        "gsrsearch": f"{query} filetype:bitmap", "gsrlimit": 20,
+        "prop": "imageinfo", "iiprop": "url|size|mime|extmetadata", "iiurlwidth": 1920,
+    }
+    try:
+        r = requests.get("https://commons.wikimedia.org/w/api.php", params=params, timeout=30,
+                         headers={"User-Agent": f"{UA} contact: {WIKI_CONTACT}"})
+    except Exception as e:
+        print(f"  wikimedia request failed: {e}", flush=True)
+        return []
+    if r.status_code != 200:
+        st = _prov["wikimedia"]
+        st["fails"] = st.get("fails", 0) + 1
+        print(f"  wikimedia HTTP {r.status_code} (failure {st['fails']})", flush=True)
+        if st["fails"] >= 3:
+            st["disabled"] = f"HTTP {r.status_code} x3"
+        return []
+    _prov["wikimedia"]["fails"] = 0
+    out = []
+    for pg in ((r.json().get("query") or {}).get("pages") or {}).values():
+        info = (pg.get("imageinfo") or [{}])[0]
+        if info.get("mime") not in ("image/jpeg", "image/png") or int(info.get("width") or 0) < 1280:
+            continue
+        meta = info.get("extmetadata") or {}
+        lic = (meta.get("LicenseShortName") or {}).get("value", "")
+        artist = re.sub(r"<[^>]+>", "", (meta.get("Artist") or {}).get("value", "") or "").strip()
+        title = pg.get("title", "")
+        out.append({
+            "kind": "image", "id": f"wm:{title}", "urls": [info.get("thumburl"), info.get("url")],
+            "credit": f"{title.replace('File:', '')} by {artist or 'unknown'} ({lic or 'see Commons'}), Wikimedia Commons",
+        })
+    return out
+
+
+def search_unsplash(key: str, query: str) -> list:
+    r = _api_get("unsplash", "https://api.unsplash.com/search/photos",
+                 params={"query": query[:100], "per_page": 15, "orientation": "landscape"},
+                 headers={"Authorization": f"Client-ID {key}", "Accept-Version": "v1", "User-Agent": UA})
+    out = []
+    for p in (r.json().get("results", []) if r else []):
+        u = p.get("urls") or {}
+        if not u.get("raw"):
+            continue
+        out.append({
+            "kind": "image", "id": f"unsp:{p['id']}",
+            "urls": [u["raw"] + "&w=2560&q=85&fm=jpg", u.get("regular")],
+            "track": (p.get("links") or {}).get("download_location"),
+            "credit": f"Photo by {(p.get('user') or {}).get('name') or 'unknown'} on Unsplash",
+        })
+    return out
+
+
+SEARCH = {
+    "pexels": {"image": search_pexels_photos, "video": search_pexels_videos},
+    "wikimedia": {"image": search_wikimedia},
+    "unsplash": {"image": search_unsplash},
+}
+
+
+def active_providers() -> list:
+    out = []
+    for n in [x.strip() for x in VISUAL_PROVIDERS.split(",") if x.strip() in SEARCH]:
+        st = _prov[n]
+        if st["key"] is None:
+            st["key"] = "-" if n == "wikimedia" else clean_key(KEY_ENV[n])
+        if n != "wikimedia" and not st["key"]:
+            continue  # no key -> skip quietly
+        if st["disabled"]:
+            continue
+        out.append(n)
+    return out
+
+
+def search_cached(name: str, kind: str, query: str) -> list:
+    st = _prov[name]
+    if st["disabled"]:
+        return []  # provider already failed for this run: don't spend more calls on it
+    ck = (kind, query)
+    if ck not in st["cache"]:
+        fn = SEARCH[name].get(kind)
+        try:
+            st["cache"][ck] = fn(st["key"], query) if fn else []
+        except Exception as e:
+            print(f"  {name} search failed for {query!r}: {e}", flush=True)
+            st["cache"][ck] = []
+    return st["cache"][ck]
+
+
+def provider_reasons() -> str:
+    bits = [f"{n}: {st['disabled']}" for n, st in _prov.items() if st["disabled"]]
+    return "; ".join(bits) or "no provider returned a usable result"
+
+
+# ---- downloads + probing ----
+def _stream_to(url: str, dst: Path, max_mb: int):
+    import requests
+
+    with requests.get(url, headers={"User-Agent": UA}, timeout=120, stream=True) as r:
+        r.raise_for_status()
+        total = 0
+        with open(dst, "wb") as f:
+            for chunk in r.iter_content(1 << 20):
+                total += len(chunk)
+                if total > max_mb * 1024 * 1024:
+                    raise ValueError(f"file larger than {max_mb} MB")
+                f.write(chunk)
+
+
+def probe_video(path: Path):
+    """(width, height, duration) via ffprobe, or None if unreadable."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height:format=duration",
+         "-of", "json", str(path)], capture_output=True, text=True)
+    if out.returncode:
+        return None
+    d = json.loads(out.stdout or "{}")
+    st = (d.get("streams") or [{}])[0]
+    return int(st.get("width") or 0), int(st.get("height") or 0), float((d.get("format") or {}).get("duration") or 0)
+
+
+def _materialize_image(cand: dict, i: int) -> bool:
+    from PIL import Image
+
+    tmp = IMG / f"_tmp_{i:03d}"
+    for url in cand["urls"]:
         if not url:
             continue
         try:
-            data = requests.get(url, headers=PIX_HEADERS, timeout=60)
-            data.raise_for_status()
-            im = Image.open(BytesIO(data.content)).convert("RGB")
-            if im.width < 600:
+            _stream_to(url, tmp, 30)
+            im = Image.open(tmp).convert("RGB")
+            if im.width < 1200:
                 continue
-            im.save(dst, quality=92)
+            im.save(IMG / f"{i:03d}.jpg", quality=92)
+            tmp.unlink(missing_ok=True)
             return True
         except Exception as e:
             print(f"  image download failed ({url[:60]}...): {e}", flush=True)
+    tmp.unlink(missing_ok=True)
     return False
 
 
-def gradient_card(dst: Path, seed: int):
-    from PIL import Image, ImageDraw
+def _materialize_video(cand: dict, i: int) -> bool:
+    dst = VID / f"{i:03d}.mp4"
+    for url in cand["urls"]:
+        if not url:
+            continue
+        try:
+            _stream_to(url, dst, 80)
+            info = probe_video(dst)
+            if info and info[0] >= 1280 and info[2] >= 3:
+                return True
+        except Exception as e:
+            print(f"  video download failed ({url[:60]}...): {e}", flush=True)
+    dst.unlink(missing_ok=True)
+    return False
 
-    rnd = random.Random(seed)
-    top = (rnd.randint(5, 40), rnd.randint(5, 40), rnd.randint(30, 90))
-    w, h = 1920, 1080
-    img = Image.new("RGB", (w, h))
-    d = ImageDraw.Draw(img)
-    for y in range(h):
-        t = y / h
-        d.line([(0, y), (w, y)], fill=tuple(int(c * (1 - t)) for c in top))
-    img.save(dst, quality=92)
 
-
-def fetch_image(scene: dict, used: set, extra_queries=None) -> str:
-    dst = IMG / f"{scene['id']:03d}.jpg"
-    key = os.getenv("PIXABAY_API_KEY")
-    if not key:
-        if not _pix["warned_nokey"]:
-            print("WARNING: PIXABAY_API_KEY is empty/not passed to this step -> gradient cards only!", flush=True)
-            _pix["warned_nokey"] = True
-        gradient_card(dst, scene["id"])
-        return "gradient:no_key"
-
-    q = (scene.get("visual_query") or "").strip()
+def fetch_visual(scene: dict, used: set, extra_queries=None) -> dict:
+    """Resolve one scene to a visual asset. Order, for every query of the ladder:
+        Pexels (B-roll video first on every BROLL_EVERY-th scene, else photo first) -> Wikimedia -> Unsplash.
+    The procedural animated background is the final tier, so the pipeline always has something to render.
+    Returns {"type": image|video|procedural, "path": relative path under build/ or None, "source", "credit"}."""
     i = scene["id"]
-    ladder = [(q, True), (" ".join(q.split()[:2]), True)]
-    ladder += [(x, True) for x in (extra_queries or [])]
-    ladder += [(x, True) for x in SECTION_QUERIES.get(scene.get("section", ""), [])]
-    ladder += [(GENERIC_QUERIES[i % len(GENERIC_QUERIES)], True), (GENERIC_QUERIES[(i + 3) % len(GENERIC_QUERIES)], True)]
-    ladder += [(q, False), ("abstract background", False)]
+    want_video = BROLL_EVERY > 0 and i % BROLL_EVERY == 0
+    kinds = ["video", "image"] if want_video else ["image", "video"]
+    q = (scene.get("visual_query") or "").strip()
+    ladder = [q, " ".join(q.split()[:2])]
+    ladder += list(extra_queries or [])
+    ladder += SECTION_QUERIES.get(scene.get("section", ""), [])
+    ladder += [GENERIC_QUERIES[i % len(GENERIC_QUERIES)], GENERIC_QUERIES[(i + 3) % len(GENERIC_QUERIES)],
+               "abstract background"]
 
     seen = set()
-    for query, strict in ladder:
-        if not query or (query, strict) in seen:
+    for query in ladder:
+        if not query or query in seen:
             continue
-        seen.add((query, strict))
-        if _pix["disabled"]:
-            break
-        try:
-            hits = pixabay_search(key, query, strict)
-        except Exception as e:
-            print(f"  pixabay request failed for {query!r}: {e}", flush=True)
-            continue
-        hits = [h for h in hits if h.get("largeImageURL") not in used]
-        if not hits:
-            continue
-        pool = hits[:10]
-        for k in range(min(3, len(pool))):
-            h = pool[(i + k) % len(pool)]
-            if _download_image(h, dst):
-                used.add(h.get("largeImageURL"))
-                return f"pixabay:{query}"
-    gradient_card(dst, scene["id"])
-    return f"gradient:{_pix['disabled'] or 'no_results'}"
+        seen.add(query)
+        for name in active_providers():
+            for kind in kinds:
+                pool = [c for c in search_cached(name, kind, query) if c["id"] not in used]
+                for k in range(min(3, len(pool))):  # up to 3 different candidates if a download fails
+                    cand = pool[(i + k) % len(pool)]
+                    ok = _materialize_video(cand, i) if kind == "video" else _materialize_image(cand, i)
+                    if not ok:
+                        continue
+                    used.add(cand["id"])
+                    if name == "unsplash" and cand.get("track"):  # Unsplash guideline: ping download endpoint
+                        try:
+                            import requests
+                            requests.get(cand["track"], timeout=10,
+                                         headers={"Authorization": f"Client-ID {_prov[name]['key']}"})
+                        except Exception:
+                            pass
+                    rel = f"vid/{i:03d}.mp4" if kind == "video" else f"img/{i:03d}.jpg"
+                    return {"type": kind, "path": rel, "source": f"{name}:{query}", "credit": cand.get("credit")}
+    return {"type": "procedural", "path": None, "source": f"procedural ({provider_reasons()})", "credit": None}
 
 
+def check_visual_providers():
+    """Informational preflight (never blocks): shows which keys work before any LLM tokens are spent."""
+    for n in [x.strip() for x in VISUAL_PROVIDERS.split(",") if x.strip() in SEARCH]:
+        st = _prov[n]
+        if st["key"] is None:
+            st["key"] = "-" if n == "wikimedia" else clean_key(KEY_ENV[n])
+        if n != "wikimedia" and not st["key"]:
+            print(f"  [visual check] {n}: no key set -> skipped", flush=True)
+            continue
+        hits = search_cached(n, "image", "mountain")
+        if st["disabled"]:
+            print(f"  [visual check] {n}: FAILED ({st['disabled']})", flush=True)
+        else:
+            print(f"  [visual check] {n}: OK ({len(hits)} results)", flush=True)
+    print("  [visual check] procedural animated background: always available as the last tier", flush=True)
+
+
+# ---- renderers for the three asset types (each writes a clip of exactly n_frames/FPS seconds with audio) ----
+def render_video_scene(src: Path, audio: str, n_frames: int, W: int, H: int, out: Path):
+    """Pexels B-roll: fill the frame (cover-crop), loop if shorter than the narration, cut to the scene length."""
+    dur = n_frames / FPS
+    fc = (f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase:flags=lanczos,crop={W}:{H},"
+          f"fps={FPS},format=yuv420p[v];[1:a]apad,aresample=48000,aformat=channel_layouts=stereo[a]")
+    sh(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-stream_loop", "-1", "-i", src, "-i", audio,
+        "-filter_complex", fc, "-map", "[v]", "-map", "[a]", "-t", f"{dur:.3f}",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "aac", "-b:a", "160k", out])
+
+
+def render_procedural_scene(audio: str, n_frames: int, seed: int, W: int, H: int, out: Path):
+    """Animated, unique-per-scene background: moving colour waves + film grain. Rendered at 480x270 and
+    upscaled, so it is cheap on a CPU runner. Used only when no photo or clip could be found."""
+    rnd = random.Random(seed * 7919 + 13)
+    fx, fy = rnd.uniform(0.02, 0.05), rnd.uniform(0.02, 0.045)
+    sp = rnd.uniform(0.6, 1.4)
+    ha, hb = rnd.uniform(0, 6.28), rnd.uniform(0, 6.28)
+    dur = n_frames / FPS
+    lum = (f"36+26*sin(X*{fx:.4f}+T*{sp:.3f})*cos(Y*{fy:.4f}-T*{sp * 0.7:.3f})"
+           f"+18*sin((X+Y)*0.012+T*0.4)")
+    cb = f"128+38*sin(X*{fy:.4f}-T*{sp * 0.5:.3f}+{ha:.3f})"
+    cr = f"128+34*cos(Y*{fx:.4f}+T*{sp * 0.6:.3f}+{hb:.3f})"
+    src = (f"nullsrc=s=480x270:r={FPS}:d={dur:.3f},geq=lum='{lum}':cb='{cb}':cr='{cr}',"
+           f"noise=alls=8:allf=t,scale={W}:{H}:flags=lanczos,format=yuv420p")
+    sh(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", src, "-i", audio,
+        "-map", "0:v", "-map", "1:a", "-af", "apad,aresample=48000,aformat=channel_layouts=stereo",
+        "-t", f"{dur:.3f}", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-c:a", "aac", "-b:a", "160k", out])
+
+
+# --------------------------------------------------------------------------- #
+# Captions (ASS karaoke, burned in one pass)
+# --------------------------------------------------------------------------- #
 def ass_time(t: float) -> str:
     cs = int(round(max(t, 0) * 100))
     return f"{cs // 360000}:{cs // 6000 % 60:02d}:{cs // 100 % 60:02d}.{cs % 100:02d}"
@@ -706,7 +1006,11 @@ def make_ass(words, W: int, H: int, short: bool, hook: str = "") -> str:
     return header + "\n".join(events) + "\n"
 
 
+# --------------------------------------------------------------------------- #
+# SFX assets (+ synthetic fallback)
+# --------------------------------------------------------------------------- #
 def synth_sfx(name: str, dst: Path):
+    """Rough FFmpeg-synthesised stand-ins. Replace with real files in assets/sfx/ for better quality."""
     TMP.mkdir(exist_ok=True)
     if name == "riser":
         src = "anoisesrc=color=pink:amplitude=1.0:duration=4:sample_rate=48000"
@@ -715,7 +1019,7 @@ def synth_sfx(name: str, dst: Path):
         expr = ("(0.5*sin(2*PI*55*t)+0.35*sin(2*PI*55.8*t)+0.25*sin(2*PI*110*t)"
                 "+0.2*sin(2*PI*165*t)+0.15*sin(2*PI*220.5*t))*exp(-1.1*t)*min(1,t/0.02)")
         src, af = f"aevalsrc='{expr}':d=3:s=48000", "lowpass=f=1400,volume=0.9"
-    else:
+    else:  # glitch
         src = "anoisesrc=color=white:duration=0.4:sample_rate=48000"
         af = ("volume='if(lt(mod(t,0.08),0.04),1,0.15)':eval=frame,highpass=f=600,"
               "acrusher=bits=5:mode=log:mix=0.9,afade=t=out:st=0.3:d=0.1")
@@ -734,7 +1038,11 @@ def get_sfx(name: str, i: int = 0) -> Path:
     return dst
 
 
+# --------------------------------------------------------------------------- #
+# Rendering
+# --------------------------------------------------------------------------- #
 def prep_image(src: Path, W: int, H: int, dst: Path):
+    """Cover-crop to the target aspect and upscale 2x so zoompan stays smooth (no jitter)."""
     from PIL import Image
 
     im = Image.open(src).convert("RGB")
@@ -746,9 +1054,11 @@ def prep_image(src: Path, W: int, H: int, dst: Path):
 
 
 def ken_burns(idx: int, n_frames: int):
-    """Smooth ease-in/out camera move, a different one per scene so the video never feels static."""
+    """Smooth ease-in/out camera move, a different one per scene so the video never feels static.
+    Returns zoompan (z, x, y) expressions. 0 zoom-in, 1 zoom-out, 2 pan L->R, 3 pan R->L,
+    4 zoom-in drifting up-right, 5 zoom-in drifting down-left."""
     N = max(n_frames - 1, 1)
-    e = f"((on/{N})*(on/{N})*(3-2*on/{N}))"
+    e = f"((on/{N})*(on/{N})*(3-2*on/{N}))"  # smoothstep easing 0 -> 1
     cx, cy = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
     mode = idx % 6
     if mode == 0:
@@ -766,7 +1076,8 @@ def ken_burns(idx: int, n_frames: int):
 
 def render_scene(img: Path, audio: str, n_frames: int, idx: int, W: int, H: int, out: Path):
     z, x, y = ken_burns(idx, n_frames)
-    vf = f"zoompan=z='{z}':x='{x}':y='{y}':d={n_frames}:s={W}x{H}:fps={FPS},format=yuv420p"
+    mb = ",tmix=frames=3:weights='1 2 1'" if MOTION_BLUR else ""
+    vf = f"zoompan=z='{z}':x='{x}':y='{y}':d={n_frames}:s={W}x{H}:fps={FPS}{mb},format=yuv420p"
     sh(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         "-i", img, "-i", audio,
         "-vf", vf, "-af", "apad,aresample=48000", "-ac", "2",
@@ -776,6 +1087,7 @@ def render_scene(img: Path, audio: str, n_frames: int, idx: int, W: int, H: int,
 
 
 def finalize(concat: Path, ass: Path, out: Path, events: list, silences: list):
+    """One pass: burn captions, mix narration + music (muted in silence windows) + SFX at exact times."""
     inputs = ["-i", concat]
     chains = [f"[0:v]ass={ass}[v]"]
     labels = ["[0:a]"]
@@ -794,11 +1106,11 @@ def finalize(concat: Path, ass: Path, out: Path, events: list, silences: list):
         path = get_sfx(ev["kind"], k)
         length = probe_duration(path)
         f = "aformat=sample_rates=48000:channel_layouts=stereo"
-        if ev["kind"] == "riser":
+        if ev["kind"] == "riser":  # align the END of the riser with the scene cut
             d = min(length, ev["end"] - ev["start"])
             at = ev["end"] - d
             f += f",atrim=start={length - d:.3f},asetpts=PTS-STARTPTS"
-        else:
+        else:  # braam / glitch hit on the scene's first frame
             at = max(0.0, ev["start"] - (0.05 if ev["kind"] == "glitch" else 0.0))
         f += f",adelay={int(at * 1000)}:all=1,volume={SFX_GAIN[ev['kind']]}"
         inputs += ["-i", path]
@@ -823,6 +1135,9 @@ def cmd_render(target: str):
     W, H = TARGETS[target]
     script = json.loads((BUILD / "script.json").read_text(encoding="utf-8"))
     timings = {t["id"]: t for t in json.loads((BUILD / "timings.json").read_text(encoding="utf-8"))}
+    visuals = {}
+    if (BUILD / "visuals.json").exists():
+        visuals = json.loads((BUILD / "visuals.json").read_text(encoding="utf-8"))
     by_id = {s["id"]: s for s in script["scenes"]}
     short = target != "long"
     hook = ""
@@ -835,17 +1150,30 @@ def cmd_render(target: str):
     TMP.mkdir(exist_ok=True)
     OUT.mkdir(exist_ok=True)
     clips, words, events, silences, cursor = [], [], [], [], 0.0
+    kinds = {"image": 0, "video": 0, "procedural": 0}
     for idx, sc in enumerate(scenes):
         t = timings[sc["id"]]
-        if short and clips and cursor + t["dur"] > 58:
+        if short and clips and cursor + t["dur"] > 58:  # keep Shorts under 60s
             break
         n = max(1, round(t["dur"] * FPS))
         end = cursor + n / FPS
-        img = TMP / f"{target}_{idx:03d}.jpg"
-        prep_image(IMG / f"{sc['id']:03d}.jpg", W, H, img)
         clip = TMP / f"{target}_{idx:03d}.mp4"
-        render_scene(img, t["audio"], n, idx, W, H, clip)
-        img.unlink(missing_ok=True)
+
+        asset = visuals.get(str(sc["id"])) or {"type": "procedural"}
+        if asset["type"] != "procedural" and not (BUILD / asset["path"]).exists():
+            print(f"  WARNING: scene {sc['id']} asset missing, using procedural background")
+            asset = {"type": "procedural"}
+        kinds[asset["type"]] += 1
+        if asset["type"] == "video":
+            render_video_scene(BUILD / asset["path"], t["audio"], n, W, H, clip)
+        elif asset["type"] == "image":
+            img = TMP / f"{target}_{idx:03d}.jpg"
+            prep_image(BUILD / asset["path"], W, H, img)
+            render_scene(img, t["audio"], n, idx, W, H, clip)
+            img.unlink(missing_ok=True)
+        else:
+            render_procedural_scene(t["audio"], n, sc["id"], W, H, clip)
+
         for s, e, w in t["words"]:
             words.append([cursor + s, cursor + e, w])
         for kind in sc.get("sfx", []):
@@ -865,18 +1193,43 @@ def cmd_render(target: str):
     ass = TMP / f"{target}.ass"
     ass.write_text(make_ass(words, W, H, short, hook), encoding="utf-8")
     finalize(concat, ass, OUT / f"{target}.mp4", events, silences)
-    print(f"Rendered {target}: {cursor:.1f}s | sfx={[e['kind'] for e in events]} silences={len(silences)}")
+    print(f"Rendered {target}: {cursor:.1f}s | visuals={kinds} | sfx={[e['kind'] for e in events]} "
+          f"silences={len(silences)}")
 
-    try:
+    try:  # thumbnail is a bonus: never fail the render because of it
         import thumbnail
         thumbnail.make_for_target(target)
     except Exception as e:
         print(f"WARNING: thumbnail failed: {e}")
 
 
+# --------------------------------------------------------------------------- #
+# Prepare
+# --------------------------------------------------------------------------- #
+def make_poster(asset: dict, sid: int, audio: str):
+    """Still frame for every scene so thumbnail.py always has build/img/NNN.jpg (photos already have one)."""
+    dst = IMG / f"{sid:03d}.jpg"
+    if asset["type"] == "image" and dst.exists():
+        return
+    if asset["type"] == "video":
+        sh(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-ss", "1", "-i", BUILD / asset["path"],
+            "-frames:v", "1", "-vf", "scale=1920:-2", "-q:v", "2", dst])
+        return
+    TMP.mkdir(exist_ok=True)
+    tmp = TMP / f"poster_{sid:03d}.mp4"
+    render_procedural_scene(audio, 2 * FPS, sid, 1920, 1080, tmp)
+    sh(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-ss", "0.5", "-i", tmp,
+        "-frames:v", "1", "-q:v", "2", dst])
+
+
 def cmd_prepare():
-    for d in (BUILD, AUDIO, IMG):
+    from collections import Counter
+
+    for d in (BUILD, AUDIO, IMG, VID):
         d.mkdir(parents=True, exist_ok=True)
+
+    print("Checking visual providers...", flush=True)
+    check_visual_providers()  # informational; the procedural tier means the run never stops here
 
     db = dedupe.load()
     override = (os.getenv("TOPIC") or "").strip()
@@ -889,28 +1242,37 @@ def cmd_prepare():
         topic, angle, text, vec = choose_topic(db)
 
     script = generate_script(topic, angle)
-    (BUILD / "script.json").write_text(json.dumps(script, ensure_ascii=False, indent=2), encoding="utf-8")
-    (BUILD / "verify.txt").write_text("\n".join(script.get("verify", [])), encoding="utf-8")
-
     timings = asyncio.run(tts_all(script["scenes"]))
     (BUILD / "timings.json").write_text(json.dumps(timings, ensure_ascii=False), encoding="utf-8")
 
-    used, report = set(), {}
+    used, visuals, credits = set(), {}, []
     extra = topic_queries(script, topic)
     for sc in script["scenes"]:
-        report[sc["id"]] = fetch_image(sc, used, extra)
-        time.sleep(0.3)
-    (BUILD / "img_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-    real = sum(v.startswith("pixabay") for v in report.values())
-    print(f"Images: {real}/{len(report)} real photos, {len(report) - real} gradient fallbacks", flush=True)
-    for sid, src in report.items():
-        print(f"  scene {sid:>2}: {src}")
-    if real < 0.3 * len(report) and os.getenv("ALLOW_GRADIENT") != "1":
-        raise SystemExit(
-            "Too many gradient fallbacks. Check that the PIXABAY_API_KEY secret exists and is passed to the "
-            f"'prepare' step. Last Pixabay error: {_pix['disabled'] or 'none (no search results)'}. "
-            "Set ALLOW_GRADIENT=1 to ignore."
-        )
+        asset = fetch_visual(sc, used, extra)
+        visuals[str(sc["id"])] = asset
+        if asset.get("credit"):
+            credits.append(f"Scene {sc['id']}: {asset['credit']}")
+        print(f"  scene {sc['id']:>2}: {asset['type']:<10} {asset['source']}", flush=True)
+        time.sleep(0.2)
+
+    audio_by_id = {t["id"]: t["audio"] for t in timings}
+    for sc in script["scenes"]:  # poster frames: needed by thumbnail.py for every scene
+        try:
+            make_poster(visuals[str(sc["id"])], sc["id"], audio_by_id[sc["id"]])
+        except Exception as e:
+            print(f"  WARNING: poster for scene {sc['id']} failed: {e}", flush=True)
+
+    counts = Counter(a["type"] for a in visuals.values())
+    (BUILD / "visuals.json").write_text(json.dumps(visuals, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"Visuals: {dict(counts)}", flush=True)
+    if counts.get("procedural", 0) > 0.3 * len(visuals):
+        print("NOTE: many scenes use the procedural animated background. Check the Pexels key and the "
+              "[visual check] lines above; a more specific visual_query also helps.", flush=True)
+
+    if credits:  # attribution goes into the description (required for CC-BY-style Wikimedia images)
+        script["description"] = (script.get("description", "") + "\n\nVisual credits:\n" + "\n".join(credits)).strip()
+    (BUILD / "script.json").write_text(json.dumps(script, ensure_ascii=False, indent=2), encoding="utf-8")
+    (BUILD / "verify.txt").write_text("\n".join(script.get("verify", [])), encoding="utf-8")
 
     dedupe.save_entry_file(dedupe.make_entry(topic, text, vec, script["title"]))
     total = sum(t["dur"] for t in timings)
