@@ -10,7 +10,7 @@ Daily documentary pipeline.
 LLM: any OpenAI-compatible endpoint (default: Groq free tier, openai/gpt-oss-*). Script generation is
 CHUNKED (1 plan call + WRITE_PARTS write calls + small transliteration batches) and paced by a
 tokens-per-minute limiter (LLM_TPM), so the free-tier limits are never exceeded.
-Visuals: Pexels photos + B-roll video -> Wikimedia Commons -> Unsplash (optional) -> procedural animated background.
+Visuals (zero API key): Wikimedia Commons images + B-roll -> Openverse -> NASA -> procedural animated background.
 
 Design: audio-first timeline. Every scene's length = its TTS audio length, so visuals and
 narration can never drift. Scenes are rendered one by one with FFmpeg (low RAM), concatenated
@@ -89,9 +89,8 @@ SFX_GAIN = {
 }
 SFX_CAPS = {"riser": 6, "braam": 4, "glitch": 5, "silence": 4}  # per video, keeps effects meaningful
 SFX_EXT = (".wav", ".mp3", ".ogg", ".flac", ".m4a")
-
-VISUAL_PROVIDERS = env("VISUAL_PROVIDERS", "pexels,wikimedia,unsplash")  # Pixabay intentionally not used
-BROLL_EVERY = int(env("BROLL_EVERY", "3"))      # every Nth scene tries a Pexels B-roll video first (0 = never)
+VISUAL_PROVIDERS = env("VISUAL_PROVIDERS", "wikimedia,openverse,nasa")  # all keyless: no API key needed
+BROLL_EVERY = int(env("BROLL_EVERY", "3"))      # every Nth scene tries a B-roll video first (0 = never)
 MOTION_BLUR = env("MOTION_BLUR", "1") == "1"    # subtle 3-frame blend on Ken Burns shots
 WIKI_CONTACT = env("WIKI_CONTACT", "https://github.com")  # Wikimedia asks for contact info in User-Agent
 
@@ -565,10 +564,13 @@ def cmd_voicetest():
 
 
 # --------------------------------------------------------------------------- #
-# Visuals: Pexels (HD photos + B-roll video) -> Wikimedia Commons (no key)
-#          -> Unsplash (optional) -> procedural animated background (always available)
+# Visuals (ZERO API KEY): Wikimedia Commons (images + B-roll video) -> Openverse (commercial-licence images)
+#                         -> NASA Image and Video Library (public domain) -> procedural animated background
 # --------------------------------------------------------------------------- #
-UA = "yt-documentary-pipeline/2.0 (visual fetcher; see repo for contact)"
+UA = f"yt-documentary-pipeline/3.0 (zero-key visual fetcher; contact: {WIKI_CONTACT})"
+COMMONS_API = "https://commons.wikimedia.org/w/api.php"
+OPENVERSE_API = "https://api.openverse.org/v1/images/"
+NASA_API = "https://images-api.nasa.gov/search"
 GENERIC_QUERIES = [
     "abstract technology", "futuristic technology", "space galaxy", "science laboratory",
     "neural network", "digital data", "night city lights", "abstract light",
@@ -584,19 +586,9 @@ SECTION_QUERIES = {
 STOPWORDS = {"the", "and", "that", "with", "from", "this", "what", "your", "into", "will", "have", "about",
              "when", "they", "them", "than", "then", "which", "while", "there", "their", "here", "just"}
 
-KEY_ENV = {"pexels": "PEXELS_API_KEY", "unsplash": "UNSPLASH_ACCESS_KEY"}  # wikimedia needs no key
-# provider -> (max calls, window in seconds); kept below each free tier
-LIMITS = {"pexels": (190, 3600), "unsplash": (45, 3600), "wikimedia": (50, 60)}
-_prov = {n: {"calls": [], "cache": {}, "disabled": None, "key": None} for n in LIMITS}
-
-
-def clean_key(name: str) -> str:
-    """Secrets pasted from a phone can carry a newline, spaces or quotes. Strip them. Never prints the key."""
-    raw = os.getenv(name) or ""
-    key = "".join(raw.strip().strip("\"'").split())
-    if raw and key != raw:
-        print(f"  note: {name} had whitespace/quotes ({len(raw)} -> {len(key)} chars); cleaned", flush=True)
-    return key
+# keyless public APIs: polite per-provider limits (calls, window in seconds)
+LIMITS = {"wikimedia": (50, 60), "openverse": (15, 60), "nasa": (30, 60)}
+_prov = {n: {"calls": [], "cache": {}, "disabled": None, "fails": 0} for n in LIMITS}
 
 
 def topic_queries(script: dict, topic: str = "") -> list:
@@ -611,182 +603,196 @@ def topic_queries(script: dict, topic: str = "") -> list:
     return out + uniq[:2]
 
 
+def license_ok(text: str) -> bool:
+    """Commercial-use check on a licence string. Any NonCommercial (nc) or NoDerivatives (nd) licence is rejected.
+    Accepts public domain / CC0 / CC BY and CC BY-SA variants."""
+    t = re.sub(r"[-_/]", " ", (text or "").lower())
+    if not t.strip():
+        return False
+    if re.search(r"\b(nc|nd)\b", t):
+        return False
+    return bool(re.search(r"public domain|\bpdm\b|\bcc0\b|\bcc\b|\bby\b|\bpd\b", t))
+
+
 def _allow_call(name: str) -> bool:
     maxn, window = LIMITS[name]
     st, now = _prov[name], time.time()
     st["calls"] = [t for t in st["calls"] if now - t < window]
     if len(st["calls"]) >= maxn:
-        if window <= 60:
-            time.sleep(max(1.0, window - (now - st["calls"][0]) + 0.5))
-        else:
-            st["disabled"] = f"quota reached ({maxn}/{window}s) for this run"
-            print(f"  {name}: {st['disabled']} -> next provider", flush=True)
-            return False
+        time.sleep(max(1.0, window - (now - st["calls"][0]) + 0.5))
     st["calls"].append(time.time())
     return True
 
 
-def _api_get(name: str, url: str, **kw):
-    """GET with throttling. Auth/quota failures disable the provider for the rest of the run."""
+def _get_json(name: str, url: str, params=None):
+    """Keyless GET with throttling. Repeated failures disable the provider for the rest of the run."""
     import requests
 
     st = _prov[name]
     for attempt in range(3):
-        if not _allow_call(name):
+        if st["disabled"] or not _allow_call(name):
             return None
-        r = requests.get(url, timeout=30, **kw)
+        try:
+            r = requests.get(url, params=params, headers={"User-Agent": UA}, timeout=30)
+        except Exception as e:
+            st["fails"] += 1
+            print(f"  {name} request failed: {e}", flush=True)
+            if st["fails"] >= 3:
+                st["disabled"] = "network errors x3"
+            return None
         if r.status_code == 429:
-            if LIMITS[name][1] > 60:
-                st["disabled"] = "HTTP 429 rate limited"
-                print(f"  {name}: {st['disabled']} -> next provider", flush=True)
-                return None
             time.sleep(20 * (attempt + 1))
             continue
-        if r.status_code in (400, 401, 403):
-            st["disabled"] = f"HTTP {r.status_code}: {r.text[:120].strip()}"
-            print(f"  {name.upper()} REQUEST ERROR -> {st['disabled']}", flush=True)
+        if r.status_code >= 400:
+            st["fails"] += 1
+            print(f"  {name} HTTP {r.status_code} (failure {st['fails']})", flush=True)
+            if st["fails"] >= 3:
+                st["disabled"] = f"HTTP {r.status_code} x3"
             return None
-        r.raise_for_status()
-        return r
+        st["fails"] = 0
+        try:
+            return r.json()
+        except ValueError:
+            return None
     return None
 
 
-def _pick_video_file(files: list):
-    """Best landscape MP4 between 1280 and 2560 px wide, closest to 1080p (keeps downloads sane)."""
-    ok = [f for f in files
-          if str(f.get("file_type", "")).startswith("video/mp4")
-          and 1280 <= int(f.get("width") or 0) <= 2560
-          and int(f.get("width") or 0) > int(f.get("height") or 1)]
-    return min(ok, key=lambda f: abs(int(f["width"]) - 1920)) if ok else None
+def _pages(data) -> list:
+    return list(((data or {}).get("query") or {}).get("pages", {}).values())
 
 
-# ---- search functions: each returns a list of candidates {kind, id, urls, credit, ...} ----
-def search_pexels_photos(key: str, query: str) -> list:
-    """Pexels photo search. Endpoint https://api.pexels.com/v1/search, raw key in Authorization (no 'Bearer')."""
-    r = _api_get("pexels", "https://api.pexels.com/v1/search",
-                 params={"query": query[:100], "orientation": "landscape", "per_page": 15},
-                 headers={"Authorization": key, "User-Agent": UA})
-    out = []
-    for p in (r.json().get("photos", []) if r else []):
-        src = p.get("src") or {}
-        if not src.get("original"):
-            continue
-        out.append({
-            "kind": "image", "id": f"pexp:{p['id']}",
-            "urls": [src["original"] + "?auto=compress&cs=tinysrgb&w=2560", src["original"], src.get("large2x")],
-            "credit": f"Photo by {p.get('photographer') or 'unknown'} on Pexels",
-        })
-    return out
-
-
-def search_pexels_videos(key: str, query: str) -> list:
-    """Pexels B-roll video search. Endpoint https://api.pexels.com/videos/search."""
-    r = _api_get("pexels", "https://api.pexels.com/videos/search",
-                 params={"query": query[:100], "orientation": "landscape", "per_page": 15},
-                 headers={"Authorization": key, "User-Agent": UA})
-    out = []
-    for v in (r.json().get("videos", []) if r else []):
-        if (v.get("duration") or 0) < 6:
-            continue
-        f = _pick_video_file(v.get("video_files") or [])
-        if not f:
-            continue
-        out.append({
-            "kind": "video", "id": f"pexv:{v['id']}", "urls": [f["link"]],
-            "credit": f"Video by {(v.get('user') or {}).get('name') or 'unknown'} on Pexels",
-        })
-    return out
-
-
-def search_wikimedia(_key: str, query: str) -> list:
-    """Wikimedia Commons (public domain / CC archival imagery). No API key. Keeps only JPEG/PNG >= 1280 px wide."""
-    import requests
-
-    if not _allow_call("wikimedia"):
-        return []
-    params = {
+# ---- search functions: each returns candidates {kind, id, urls | manifest, credit} ----
+def search_wikimedia_image(_key: str, query: str) -> list:
+    """Wikimedia Commons image search (no key). Keeps JPEG/PNG >= 1280 px with a commercial-use licence."""
+    data = _get_json("wikimedia", COMMONS_API, {
         "action": "query", "format": "json", "generator": "search", "gsrnamespace": 6,
         "gsrsearch": f"{query} filetype:bitmap", "gsrlimit": 20,
         "prop": "imageinfo", "iiprop": "url|size|mime|extmetadata", "iiurlwidth": 1920,
-    }
-    try:
-        r = requests.get("https://commons.wikimedia.org/w/api.php", params=params, timeout=30,
-                         headers={"User-Agent": f"{UA} contact: {WIKI_CONTACT}"})
-    except Exception as e:
-        print(f"  wikimedia request failed: {e}", flush=True)
-        return []
-    if r.status_code != 200:
-        st = _prov["wikimedia"]
-        st["fails"] = st.get("fails", 0) + 1
-        print(f"  wikimedia HTTP {r.status_code} (failure {st['fails']})", flush=True)
-        if st["fails"] >= 3:
-            st["disabled"] = f"HTTP {r.status_code} x3"
-        return []
-    _prov["wikimedia"]["fails"] = 0
+    })
     out = []
-    for pg in ((r.json().get("query") or {}).get("pages") or {}).values():
+    for pg in _pages(data):
         info = (pg.get("imageinfo") or [{}])[0]
         if info.get("mime") not in ("image/jpeg", "image/png") or int(info.get("width") or 0) < 1280:
             continue
         meta = info.get("extmetadata") or {}
         lic = (meta.get("LicenseShortName") or {}).get("value", "")
+        if not license_ok(lic):
+            continue
         artist = re.sub(r"<[^>]+>", "", (meta.get("Artist") or {}).get("value", "") or "").strip()
         title = pg.get("title", "")
         out.append({
             "kind": "image", "id": f"wm:{title}", "urls": [info.get("thumburl"), info.get("url")],
-            "credit": f"{title.replace('File:', '')} by {artist or 'unknown'} ({lic or 'see Commons'}), Wikimedia Commons",
+            "credit": f"{title.replace('File:', '')} by {artist or 'unknown'} ({lic}), Wikimedia Commons",
         })
     return out
 
 
-def search_unsplash(key: str, query: str) -> list:
-    r = _api_get("unsplash", "https://api.unsplash.com/search/photos",
-                 params={"query": query[:100], "per_page": 15, "orientation": "landscape"},
-                 headers={"Authorization": f"Client-ID {key}", "Accept-Version": "v1", "User-Agent": UA})
+def search_wikimedia_video(_key: str, query: str) -> list:
+    """Wikimedia Commons B-roll video search (no key). WebM/Ogg, >= 1280 px wide, >= 6 s, <= 80 MB."""
+    data = _get_json("wikimedia", COMMONS_API, {
+        "action": "query", "format": "json", "generator": "search", "gsrnamespace": 6,
+        "gsrsearch": f"{query} filetype:video", "gsrlimit": 15,
+        "prop": "videoinfo", "viprop": "url|size|mime|duration|dimensions|extmetadata",
+    })
     out = []
-    for p in (r.json().get("results", []) if r else []):
-        u = p.get("urls") or {}
-        if not u.get("raw"):
+    for pg in _pages(data):
+        info = (pg.get("videoinfo") or [{}])[0]
+        if info.get("mime") not in ("video/webm", "video/ogg"):
+            continue
+        if int(info.get("width") or 0) < 1280 or float(info.get("duration") or 0) < 6:
+            continue
+        if int(info.get("size") or 0) > 80 * 1024 * 1024:
+            continue
+        meta = info.get("extmetadata") or {}
+        lic = (meta.get("LicenseShortName") or {}).get("value", "")
+        if not license_ok(lic):
+            continue
+        artist = re.sub(r"<[^>]+>", "", (meta.get("Artist") or {}).get("value", "") or "").strip()
+        title = pg.get("title", "")
+        out.append({
+            "kind": "video", "id": f"wmv:{title}", "urls": [info.get("url")],
+            "credit": f"{title.replace('File:', '')} by {artist or 'unknown'} ({lic}), Wikimedia Commons",
+        })
+    return out
+
+
+def search_openverse(_key: str, query: str) -> list:
+    """Openverse (aggregator of CC-licensed images). license_type=commercial plus our own licence check."""
+    data = _get_json("openverse", OPENVERSE_API, {
+        "q": query[:100], "license_type": "commercial", "aspect_ratio": "wide", "page_size": 20,
+    })
+    out = []
+    for r in (data or {}).get("results", []):
+        url = r.get("url") or ""
+        if not url.lower().split("?")[0].endswith((".jpg", ".jpeg", ".png")):
+            continue
+        if int(r.get("width") or 0) < 1200:
+            continue
+        lic = r.get("license") or ""
+        if not license_ok(lic):
             continue
         out.append({
-            "kind": "image", "id": f"unsp:{p['id']}",
-            "urls": [u["raw"] + "&w=2560&q=85&fm=jpg", u.get("regular")],
-            "track": (p.get("links") or {}).get("download_location"),
-            "credit": f"Photo by {(p.get('user') or {}).get('name') or 'unknown'} on Unsplash",
+            "kind": "image", "id": f"ov:{r.get('id')}", "urls": [url],
+            "credit": f"{r.get('title') or 'Untitled'} by {r.get('creator') or 'unknown'} "
+                      f"({lic.upper()}, Openverse; source: {r.get('foreign_landing_url') or 'n/a'})",
         })
     return out
+
+
+def search_nasa(_key: str, query: str) -> list:
+    """NASA Image and Video Library (no key). Mostly public domain; NASA usage guidelines still apply."""
+    data = _get_json("nasa", NASA_API, {"q": query[:100], "media_type": "image", "page_size": 20})
+    out = []
+    for item in ((data or {}).get("collection") or {}).get("items", []):
+        d = (item.get("data") or [{}])[0]
+        if not item.get("href"):
+            continue
+        out.append({
+            "kind": "image", "id": f"nasa:{d.get('nasa_id')}", "urls": [], "manifest": item["href"],
+            "credit": f"{d.get('title') or 'NASA image'} (NASA Image and Video Library; NASA usage guidelines apply)",
+        })
+    return out
+
+
+def _candidate_urls(cand: dict) -> list:
+    """Direct URLs for a candidate. NASA items carry a manifest, expanded lazily to the largest sizes."""
+    if cand.get("urls"):
+        return cand["urls"]
+    if cand.get("manifest"):
+        data = _get_json("nasa", cand["manifest"])
+        if isinstance(data, list):
+            files = [u for u in data if isinstance(u, str)]
+            ranked = []
+            for tag in ("~orig", "~large", "~medium"):
+                ranked += [u for u in files if tag in u and u.lower().endswith((".jpg", ".jpeg", ".png"))]
+            return ranked[:3]
+    return []
 
 
 SEARCH = {
-    "pexels": {"image": search_pexels_photos, "video": search_pexels_videos},
-    "wikimedia": {"image": search_wikimedia},
-    "unsplash": {"image": search_unsplash},
+    "wikimedia": {"image": search_wikimedia_image, "video": search_wikimedia_video},
+    "openverse": {"image": search_openverse},
+    "nasa": {"image": search_nasa},
 }
 
 
 def active_providers() -> list:
     out = []
     for n in [x.strip() for x in VISUAL_PROVIDERS.split(",") if x.strip() in SEARCH]:
-        st = _prov[n]
-        if st["key"] is None:
-            st["key"] = "-" if n == "wikimedia" else clean_key(KEY_ENV[n])
-        if n != "wikimedia" and not st["key"]:
-            continue  # no key -> skip quietly
-        if st["disabled"]:
-            continue
-        out.append(n)
+        if not _prov[n]["disabled"]:
+            out.append(n)
     return out
 
 
 def search_cached(name: str, kind: str, query: str) -> list:
     st = _prov[name]
     if st["disabled"]:
-        return []  # provider already failed for this run: don't spend more calls on it
+        return []
     ck = (kind, query)
     if ck not in st["cache"]:
         fn = SEARCH[name].get(kind)
         try:
-            st["cache"][ck] = fn(st["key"], query) if fn else []
+            st["cache"][ck] = fn(None, query) if fn else []
         except Exception as e:
             print(f"  {name} search failed for {query!r}: {e}", flush=True)
             st["cache"][ck] = []
@@ -829,11 +835,11 @@ def _materialize_image(cand: dict, i: int) -> bool:
     from PIL import Image
 
     tmp = IMG / f"_tmp_{i:03d}"
-    for url in cand["urls"]:
+    for url in _candidate_urls(cand):
         if not url:
             continue
         try:
-            _stream_to(url, tmp, 30)
+            _stream_to(url, tmp, 40)
             im = Image.open(tmp).convert("RGB")
             if im.width < 1200:
                 continue
@@ -848,7 +854,7 @@ def _materialize_image(cand: dict, i: int) -> bool:
 
 def _materialize_video(cand: dict, i: int) -> bool:
     dst = VID / f"{i:03d}.mp4"
-    for url in cand["urls"]:
+    for url in cand.get("urls") or []:
         if not url:
             continue
         try:
@@ -863,8 +869,8 @@ def _materialize_video(cand: dict, i: int) -> bool:
 
 
 def fetch_visual(scene: dict, used: set, extra_queries=None) -> dict:
-    """Resolve one scene to a visual asset. Order, for every query of the ladder:
-        Pexels (B-roll video first on every BROLL_EVERY-th scene, else photo first) -> Wikimedia -> Unsplash.
+    """Resolve one scene to a visual asset, with zero API keys. For every query of the ladder the providers
+    are asked in order (Wikimedia -> Openverse -> NASA). Every BROLL_EVERY-th scene tries a video clip first.
     The procedural animated background is the final tier, so the pipeline always has something to render.
     Returns {"type": image|video|procedural, "path": relative path under build/ or None, "source", "credit"}."""
     i = scene["id"]
@@ -891,30 +897,17 @@ def fetch_visual(scene: dict, used: set, extra_queries=None) -> dict:
                     if not ok:
                         continue
                     used.add(cand["id"])
-                    if name == "unsplash" and cand.get("track"):  # Unsplash guideline: ping download endpoint
-                        try:
-                            import requests
-                            requests.get(cand["track"], timeout=10,
-                                         headers={"Authorization": f"Client-ID {_prov[name]['key']}"})
-                        except Exception:
-                            pass
                     rel = f"vid/{i:03d}.mp4" if kind == "video" else f"img/{i:03d}.jpg"
                     return {"type": kind, "path": rel, "source": f"{name}:{query}", "credit": cand.get("credit")}
     return {"type": "procedural", "path": None, "source": f"procedural ({provider_reasons()})", "credit": None}
 
 
 def check_visual_providers():
-    """Informational preflight (never blocks): shows which keys work before any LLM tokens are spent."""
+    """Informational preflight. Never blocks: the procedural tier guarantees the run continues."""
     for n in [x.strip() for x in VISUAL_PROVIDERS.split(",") if x.strip() in SEARCH]:
-        st = _prov[n]
-        if st["key"] is None:
-            st["key"] = "-" if n == "wikimedia" else clean_key(KEY_ENV[n])
-        if n != "wikimedia" and not st["key"]:
-            print(f"  [visual check] {n}: no key set -> skipped", flush=True)
-            continue
         hits = search_cached(n, "image", "mountain")
-        if st["disabled"]:
-            print(f"  [visual check] {n}: FAILED ({st['disabled']})", flush=True)
+        if _prov[n]["disabled"]:
+            print(f"  [visual check] {n}: FAILED ({_prov[n]['disabled']})", flush=True)
         else:
             print(f"  [visual check] {n}: OK ({len(hits)} results)", flush=True)
     print("  [visual check] procedural animated background: always available as the last tier", flush=True)
@@ -922,7 +915,7 @@ def check_visual_providers():
 
 # ---- renderers for the three asset types (each writes a clip of exactly n_frames/FPS seconds with audio) ----
 def render_video_scene(src: Path, audio: str, n_frames: int, W: int, H: int, out: Path):
-    """Pexels B-roll: fill the frame (cover-crop), loop if shorter than the narration, cut to the scene length."""
+    """B-roll clip: fill the frame (cover-crop), loop if shorter than the narration, cut to the scene length."""
     dur = n_frames / FPS
     fc = (f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase:flags=lanczos,crop={W}:{H},"
           f"fps={FPS},format=yuv420p[v];[1:a]apad,aresample=48000,aformat=channel_layouts=stereo[a]")
@@ -931,18 +924,36 @@ def render_video_scene(src: Path, audio: str, n_frames: int, W: int, H: int, out
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "aac", "-b:a", "160k", out])
 
 
+PROC_STYLES = ["waves", "mesh", "grid"]  # animated FFmpeg generators, one style per seed (rotates per scene)
+
+
 def render_procedural_scene(audio: str, n_frames: int, seed: int, W: int, H: int, out: Path):
-    """Animated, unique-per-scene background: moving colour waves + film grain. Rendered at 480x270 and
-    upscaled, so it is cheap on a CPU runner. Used only when no photo or clip could be found."""
+    """Final-tier animated background, generated by FFmpeg (no files, no keys):
+      waves -> moving colour interference waves      mesh -> pulsing node lattice      grid -> sweeping grid lines
+    Rendered at 480x270 and upscaled, so it is cheap on a CPU runner."""
     rnd = random.Random(seed * 7919 + 13)
-    fx, fy = rnd.uniform(0.02, 0.05), rnd.uniform(0.02, 0.045)
+    style = PROC_STYLES[seed % len(PROC_STYLES)]
     sp = rnd.uniform(0.6, 1.4)
     ha, hb = rnd.uniform(0, 6.28), rnd.uniform(0, 6.28)
     dur = n_frames / FPS
-    lum = (f"36+26*sin(X*{fx:.4f}+T*{sp:.3f})*cos(Y*{fy:.4f}-T*{sp * 0.7:.3f})"
-           f"+18*sin((X+Y)*0.012+T*0.4)")
-    cb = f"128+38*sin(X*{fy:.4f}-T*{sp * 0.5:.3f}+{ha:.3f})"
-    cr = f"128+34*cos(Y*{fx:.4f}+T*{sp * 0.6:.3f}+{hb:.3f})"
+    if style == "waves":
+        fx, fy = rnd.uniform(0.02, 0.05), rnd.uniform(0.02, 0.045)
+        lum = (f"36+26*sin(X*{fx:.4f}+T*{sp:.3f})*cos(Y*{fy:.4f}-T*{sp * 0.7:.3f})"
+               f"+18*sin((X+Y)*0.012+T*0.4)")
+        cb = f"128+38*sin(X*{fy:.4f}-T*{sp * 0.5:.3f}+{ha:.3f})"
+        cr = f"128+34*cos(Y*{fx:.4f}+T*{sp * 0.6:.3f}+{hb:.3f})"
+    elif style == "mesh":
+        ax, ay = rnd.uniform(0.07, 0.12), rnd.uniform(0.07, 0.12)
+        lum = (f"30+70*pow(0.5+0.5*cos(X*{ax:.4f}+T*{sp:.3f}),10)"
+               f"*pow(0.5+0.5*cos(Y*{ay:.4f}-T*{sp * 0.8:.3f}),10)")
+        cb = f"128+25*sin(X*0.004+T*0.2+{ha:.3f})"
+        cr = f"128+25*cos(Y*0.004-T*0.15+{hb:.3f})"
+    else:  # grid
+        ax = rnd.uniform(0.10, 0.16)
+        lum = (f"28+60*pow(0.5+0.5*cos(X*{ax:.4f}+T*{sp * 2:.3f}),40)"
+               f"+60*pow(0.5+0.5*cos(Y*{ax:.4f}-T*{sp * 1.5:.3f}),40)")
+        cb = f"120+20*sin(T*0.4+{ha:.3f})"
+        cr = f"140+20*cos(T*0.3+{hb:.3f})"
     src = (f"nullsrc=s=480x270:r={FPS}:d={dur:.3f},geq=lum='{lum}':cb='{cb}':cr='{cr}',"
            f"noise=alls=8:allf=t,scale={W}:{H}:flags=lanczos,format=yuv420p")
     sh(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", src, "-i", audio,
@@ -1266,8 +1277,8 @@ def cmd_prepare():
     (BUILD / "visuals.json").write_text(json.dumps(visuals, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"Visuals: {dict(counts)}", flush=True)
     if counts.get("procedural", 0) > 0.3 * len(visuals):
-        print("NOTE: many scenes use the procedural animated background. Check the Pexels key and the "
-              "[visual check] lines above; a more specific visual_query also helps.", flush=True)
+        print("NOTE: many scenes use the procedural animated background. A more specific visual_query "
+              "usually finds more photos; see the [visual check] lines above.", flush=True)
 
     if credits:  # attribution goes into the description (required for CC-BY-style Wikimedia images)
         script["description"] = (script.get("description", "") + "\n\nVisual credits:\n" + "\n".join(credits)).strip()
