@@ -6,22 +6,6 @@ Daily documentary pipeline.
   python pipeline.py render --target long     # 1920x1080 long video + thumbnail     (out/long.mp4)
   python pipeline.py render --target short1   # 1080x1920 Shorts: short1..short3     (out/shortN.mp4)
   python pipeline.py voicetest                # sample Hinglish clips for every voice option (out/)
-
-LLM: any OpenAI-compatible endpoint (default: Groq free tier, openai/gpt-oss-*). Script generation is
-CHUNKED (1 plan call + WRITE_PARTS write calls + small transliteration batches) and paced by a
-tokens-per-minute limiter (LLM_TPM), so the free-tier limits are never exceeded.
-Images: Pixabay API (PIXABAY_API_KEY), gradient fallback if missing.
-
-Design: audio-first timeline. Every scene's length = its TTS audio length, so visuals and
-narration can never drift. Scenes are rendered one by one with FFmpeg (low RAM), concatenated
-with stream copy, then captions + music + SFX are mixed/burned in ONE final pass.
-
-SFX tags (per scene, from the script's "sfx" list), files looked up in assets/sfx/:
-  riser   -> ENDS exactly at the scene's cut (builds into the next scene)
-  braam   -> HITS at the scene's first frame (the reveal)
-  glitch  -> short digital burst at the scene's first frame
-  silence -> the scene gets extra tail pause and the background music is muted for that tail
-Missing files are synthesised with FFmpeg as a fallback, so the pipeline never breaks.
 """
 import argparse
 import asyncio
@@ -38,31 +22,26 @@ import dedupe
 
 BUILD, OUT, TMP = Path("build"), Path("out"), Path("tmp")
 AUDIO, IMG = BUILD / "audio", BUILD / "img"
-MUSIC = Path("assets/music.mp3")  # optional background music (you must own the license)
-SFX_DIR = Path("assets/sfx")      # riser*.wav, braam*.wav, glitch*.wav (variants rotate: riser_1, riser_2 ...)
+MUSIC = Path("assets/music.mp3")
+SFX_DIR = Path("assets/sfx")
 
 
 def env(name: str, default: str) -> str:
-    return os.getenv(name) or default  # treats empty string (unset GH var) as default
+    return os.getenv(name) or default
 
 
-# ---- LLM (OpenAI-compatible; Groq by default) ----
+# ---- LLM Configuration ----
 LLM_BASE = env("LLM_BASE_URL", "https://api.groq.com/openai/v1")
 LLM_KEY = os.getenv("GROQ_API_KEY") or os.getenv("LLM_API_KEY") or ""
-MODEL = env("LLM_MODEL", "openai/gpt-oss-120b")        # script writing
-FAST_MODEL = env("LLM_FAST_MODEL", "openai/gpt-oss-20b")  # topics, judge, transliteration
-FALLBACKS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]  # tried in order on 404 / decommissioned
-LLM_TPM = int(env("LLM_TPM", "7500"))          # your tokens-per-minute budget (free tier is small; check console)
-WRITE_PARTS = int(env("WRITE_PARTS", "2"))     # 2 => plan + 2 write calls = the "3-call" script
+MODEL = env("LLM_MODEL", "openai/gpt-oss-120b")
+FAST_MODEL = env("LLM_FAST_MODEL", "openai/gpt-oss-20b")
+FALLBACKS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
+LLM_TPM = int(env("LLM_TPM", "7500"))
+WRITE_PARTS = int(env("WRITE_PARTS", "2"))
 TRANSLIT_BATCH = int(env("TRANSLIT_BATCH", "10"))
 NICHE = env("NICHE", "mysteries of technology, science and the human mind")
 LANGUAGE = env("LANGUAGE", "English")
 
-# ---- Hinglish handling ------------------------------------------------------
-# Hindi neural voices stumble on Roman-script Hinglish. Fix: Claude writes every scene twice:
-#   narration -> Roman Hinglish (used for captions)       tts_text -> Devanagari, word-for-word (used for the voice)
-# Caption timing is mapped 1:1 from the Devanagari words. HINGLISH_MODE=roman skips this and
-# reads Roman text with an Indian-English voice instead.
 IS_HINGLISH = "hinglish" in LANGUAGE.lower()
 USE_DEVA = IS_HINGLISH and env("HINGLISH_MODE", "devanagari").lower() != "roman"
 if IS_HINGLISH:
@@ -77,9 +56,9 @@ LANG_DESC = (
 )
 
 FPS = int(env("FPS", "30"))
-PAD = 0.25            # seconds of breathing room after each scene
-SILENCE_EXTRA = 0.6   # extra pause appended to scenes tagged "silence"
-BORDERLINE = 0.65     # similarity band where an LLM judge double-checks topics
+PAD = 0.25
+SILENCE_EXTRA = 0.6
+BORDERLINE = 0.65
 
 MUSIC_GAIN = float(env("MUSIC_GAIN", "0.12"))
 SFX_GAIN = {
@@ -87,7 +66,7 @@ SFX_GAIN = {
     "braam": float(env("SFX_GAIN_BRAAM", "0.7")),
     "glitch": float(env("SFX_GAIN_GLITCH", "0.5")),
 }
-SFX_CAPS = {"riser": 6, "braam": 4, "glitch": 5, "silence": 4}  # per video, keeps effects meaningful
+SFX_CAPS = {"riser": 6, "braam": 4, "glitch": 5, "silence": 4}
 SFX_EXT = (".wav", ".mp3", ".ogg", ".flac", ".m4a")
 
 TARGETS = {
@@ -97,9 +76,6 @@ TARGETS = {
     "short3": (1080, 1920),
 }
 
-# --------------------------------------------------------------------------- #
-# Prompts
-# --------------------------------------------------------------------------- #
 TOPIC_SYSTEM = (
     "You pick fresh topics for a documentary-style faceless YouTube channel. "
     "Return ONLY JSON. Topics must be specific, intriguing and clearly different "
@@ -157,9 +133,6 @@ Return ONLY JSON (no markdown): {"scenes":[{"id":N,"narration":"..."}]} - exactl
 """.replace("__LANG__", LANG_DESC)
 
 
-# --------------------------------------------------------------------------- #
-# Helpers
-# --------------------------------------------------------------------------- #
 def sh(cmd):
     cmd = [str(c) for c in cmd]
     print("$", " ".join(cmd[:8]), "...", flush=True)
@@ -175,11 +148,10 @@ def probe_duration(path) -> float:
     return float(out.strip())
 
 
-_window = []  # (timestamp, tokens) used in the last 60 s
+_window = []
 
 
 def _budget_wait(est: int):
-    """Block until `est` more tokens fit into the LLM_TPM budget of the rolling 60 s window."""
     while True:
         now = time.time()
         while _window and now - _window[0][0] >= 60:
@@ -193,8 +165,6 @@ def _budget_wait(est: int):
 
 
 def claude(model: str, system: str, user: str, max_tokens: int) -> str:
-    """Chat completion on any OpenAI-compatible endpoint (name kept so nothing else changes).
-    Features: TPM pacing, 429 retry-after, model fallback on 404/decommissioned."""
     import requests
 
     if not LLM_KEY:
@@ -209,7 +179,7 @@ def claude(model: str, system: str, user: str, max_tokens: int) -> str:
                 "model": m,
                 "messages": [{"role": "system", "content": system},
                              {"role": "user", "content": user}],
-                "max_tokens": max_tokens,  # for gpt-oss this ALSO covers hidden reasoning tokens
+                "max_tokens": max_tokens,
                 "temperature": 0.7,
             }
             if "gpt-oss" in m:
@@ -223,7 +193,7 @@ def claude(model: str, system: str, user: str, max_tokens: int) -> str:
             if r.status_code == 429:
                 wait = float(r.headers.get("retry-after") or 10 * (attempt + 1))
                 print(f"  429 rate limited, sleeping {wait:.0f}s", flush=True)
-                _window.append((time.time(), LLM_TPM))  # assume the minute is spent
+                _window.append((time.time(), LLM_TPM))
                 time.sleep(wait)
                 continue
             if r.status_code == 413:
@@ -244,7 +214,7 @@ def parse_json(text: str) -> dict:
 def claude_json(model, system, user, max_tokens, tries=3) -> dict:
     last = None
     for i in range(tries):
-        try:  # on retry give the model more room (truncated JSON / reasoning ate the budget)
+        try:
             return parse_json(claude(model, system, user, int(max_tokens * (1 + 0.3 * i))))
         except SystemExit:
             raise
@@ -255,9 +225,6 @@ def claude_json(model, system, user, max_tokens, tries=3) -> dict:
     raise RuntimeError(f"LLM JSON failed after {tries} tries: {last}")
 
 
-# --------------------------------------------------------------------------- #
-# Topic + script
-# --------------------------------------------------------------------------- #
 def judge_same(a: str, b: str) -> bool:
     out = claude_json(
         FAST_MODEL, "Answer ONLY JSON.",
@@ -288,7 +255,6 @@ def choose_topic(db: dict):
 
 
 def parse_sfx(value) -> list:
-    """Accepts ["riser","braam"], "riser, braam" or "[SFX: riser]" and returns known tags."""
     text = " ".join(value) if isinstance(value, (list, tuple)) else str(value or "")
     return [n for n in ("riser", "braam", "glitch", "silence") if re.search(rf"\b{n}\b", text, re.I)]
 
@@ -297,7 +263,7 @@ def cap_sfx(scenes):
     counts = {}
     for s in scenes:
         if "silence" in s["sfx"] and "riser" in s["sfx"]:
-            s["sfx"].remove("riser")  # silence scene = music drops; a riser would fight it
+            s["sfx"].remove("riser")
         keep = []
         for tag in s["sfx"]:
             if counts.get(tag, 0) < SFX_CAPS[tag]:
@@ -307,7 +273,6 @@ def cap_sfx(scenes):
 
 
 def fill_tts_text(scenes):
-    """Devanagari twin for every scene (batched to stay far below the TPM budget)."""
     missing = [s for s in scenes if not (s.get("tts_text") or "").strip()]
     for i in range(0, len(missing), TRANSLIT_BATCH):
         batch = missing[i:i + TRANSLIT_BATCH]
@@ -327,7 +292,7 @@ def fill_tts_text(scenes):
             except (KeyError, TypeError, ValueError):
                 continue
         for s in batch:
-            s["tts_text"] = mapping.get(s["id"]) or s["narration"]  # last resort: Roman text
+            s["tts_text"] = mapping.get(s["id"]) or s["narration"]
 
 
 def outline_text(beats) -> str:
@@ -340,9 +305,8 @@ def split_ids(n: int, parts: int):
 
 
 def write_part(plan: dict, beats: list, ids: list, tail: str) -> dict:
-    """One narration call for the given beat ids. Returns {id: narration}."""
     got = {}
-    for _ in range(2):  # second pass only asks for what is still missing
+    for _ in range(2):
         want = [i for i in ids if i not in got]
         if not want:
             break
@@ -365,7 +329,6 @@ def write_part(plan: dict, beats: list, ids: list, tail: str) -> dict:
 
 
 def generate_script(topic: str, angle: str) -> dict:
-    """Chunked script: 1 PLAN call, WRITE_PARTS narration calls, then small transliteration batches."""
     plan = claude_json(
         MODEL, PLAN_GUIDE,
         f"Topic: {topic}\nAngle: {angle or 'your choice'}\nPlan the video now.", max_tokens=4500,
@@ -374,7 +337,7 @@ def generate_script(topic: str, angle: str) -> dict:
     if len(beats) < 10:
         raise RuntimeError(f"Plan too short: {len(beats)} beats")
 
-    idmap = {}  # renumber beats 1..n and remap every reference
+    idmap = {}
     for new, b in enumerate(beats, 1):
         try:
             idmap[int(b.get("id", new))] = new
@@ -417,7 +380,7 @@ def generate_script(topic: str, angle: str) -> dict:
                 j = None
             if j in ids:
                 sid.append(j)
-        if not sid:  # fallback: 4 consecutive scenes spread across the video
+        if not sid:
             start = min(k * (n // 3) + 1, max(1, n - 3))
             sid = list(range(start, min(start + 4, n + 1)))
         fixed.append({
@@ -443,12 +406,8 @@ def generate_script(topic: str, angle: str) -> dict:
     }
 
 
-# --------------------------------------------------------------------------- #
-# Voice (edge-tts) + word timings
-# --------------------------------------------------------------------------- #
 def spread_words(marks, text: str, dur: float):
-    """Turn boundary events (word- or sentence-level) into per-word [start, end, word]."""
-    if not marks:  # fallback: spread evenly by character length
+    if not marks:
         marks = [(0.0, dur, text)]
     out = []
     for off, d, t in marks:
@@ -465,8 +424,6 @@ def spread_words(marks, text: str, dur: float):
 
 
 def retarget_words(spoken, caption_text: str):
-    """Map timings of the spoken (Devanagari) words onto the caption (Roman) words.
-    1:1 when the word counts match, proportional by index otherwise."""
     cw = caption_text.split()
     if not spoken or not cw:
         return spoken
@@ -483,7 +440,6 @@ def retarget_words(spoken, caption_text: str):
 
 
 async def synth_voice(text: str, path: Path, voice: str, rate: str):
-    """Write mp3 to `path`, return boundary marks [(start, dur, text)]."""
     import edge_tts
     from tenacity import retry, stop_after_attempt, wait_exponential
 
@@ -491,7 +447,7 @@ async def synth_voice(text: str, path: Path, voice: str, rate: str):
     async def run():
         try:
             comm = edge_tts.Communicate(text, voice, rate=rate, boundary="WordBoundary")
-        except TypeError:  # older edge-tts without `boundary`
+        except TypeError:
             comm = edge_tts.Communicate(text, voice, rate=rate)
         marks = []
         with open(path, "wb") as f:
@@ -530,7 +486,6 @@ async def tts_all(scenes):
 
 
 def cmd_voicetest():
-    """Generate comparison clips so you can LISTEN and pick the best Hinglish voice."""
     OUT.mkdir(exist_ok=True)
     roman = "Socho agar ek din tumhara dimaag khud sochna band kar de, aur tumhe pata bhi na chale."
     deva = "सोचो अगर एक दिन तुम्हारा दिमाग खुद सोचना बंद कर दे, और तुम्हें पता भी न चले।"
@@ -548,12 +503,100 @@ def cmd_voicetest():
             print("wrote", OUT / f"voicetest_{name}.mp3")
 
     asyncio.run(run())
-    print("Listen to A/B (Devanagari mode) vs C/D (roman mode). Set VOICE and HINGLISH_MODE accordingly.")
+    print("Listen to A/B vs C/D. Set VOICE and HINGLISH_MODE accordingly.")
 
 
 # --------------------------------------------------------------------------- #
-# Images (Pixabay, with gradient fallback so a scene is never blank)
+# Images (Robust Pixabay Fetcher + Ladder of Fallbacks)
 # --------------------------------------------------------------------------- #
+PIX_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Referer": "https://pixabay.com/",
+}
+GENERIC_QUERIES = [
+    "abstract technology", "futuristic technology", "space galaxy", "science laboratory",
+    "neural network", "digital data", "night city lights", "abstract light",
+    "microscope science", "planet earth",
+]
+SECTION_QUERIES = {
+    "cold_open": ["mystery dark", "abstract dark"],
+    "past": ["vintage history", "old library"],
+    "present": ["modern city", "technology"],
+    "future": ["futuristic city", "space galaxy"],
+    "resolution": ["sunrise horizon", "light rays"],
+}
+STOPWORDS = {"the", "and", "that", "with", "from", "this", "what", "your", "into", "will", "have", "about",
+             "when", "they", "them", "than", "then", "which", "while", "there", "their", "here", "just"}
+_pix = {"calls": [], "cache": {}, "disabled": None, "warned_nokey": False}
+
+
+def topic_queries(script: dict, topic: str = "") -> list:
+    words = [w for w in re.findall(r"[a-z]{4,}", f"{script.get('title', '')} {topic}".lower()) if w not in STOPWORDS]
+    uniq = list(dict.fromkeys(words))
+    out = []
+    if len(uniq) >= 2:
+        out.append(" ".join(uniq[:2]))
+    if len(uniq) >= 4:
+        out.append(" ".join(uniq[2:4]))
+    return out + uniq[:2]
+
+
+def _pix_throttle():
+    now = time.time()
+    _pix["calls"] = [t for t in _pix["calls"] if now - t < 60]
+    if len(_pix["calls"]) >= 85:
+        time.sleep(max(1.0, 60 - (now - _pix["calls"][0]) + 0.5))
+    _pix["calls"].append(time.time())
+
+
+def pixabay_search(key: str, query: str, strict: bool = True) -> list:
+    import requests
+
+    ck = (query, strict)
+    if ck in _pix["cache"]:
+        return _pix["cache"][ck]
+    params = {"key": key, "q": query[:100], "safesearch": "true", "per_page": 30}
+    if strict:
+        params.update({"image_type": "photo", "orientation": "horizontal", "min_width": 1280})
+    for attempt in range(3):
+        _pix_throttle()
+        r = requests.get("https://pixabay.com/api/", params=params, headers=PIX_HEADERS, timeout=30)
+        if r.status_code == 429:
+            print(f"  pixabay 429, sleeping {20 * (attempt + 1)}s", flush=True)
+            time.sleep(20 * (attempt + 1))
+            continue
+        if r.status_code in (400, 401, 403):
+            _pix["disabled"] = f"HTTP {r.status_code}: {r.text[:150]}"
+            print(f"  PIXABAY ERROR -> {_pix['disabled']}", flush=True)
+            return []
+        r.raise_for_status()
+        hits = r.json().get("hits", [])
+        _pix["cache"][ck] = hits
+        return hits
+    return []
+
+
+def _download_image(hit: dict, dst: Path) -> bool:
+    import requests
+    from PIL import Image
+    from io import BytesIO
+
+    for url in (hit.get("fullHDURL"), hit.get("largeImageURL"), hit.get("webformatURL")):
+        if not url:
+            continue
+        try:
+            data = requests.get(url, headers=PIX_HEADERS, timeout=60)
+            data.raise_for_status()
+            im = Image.open(BytesIO(data.content)).convert("RGB")
+            if im.width < 600:
+                continue
+            im.save(dst, quality=92)
+            return True
+        except Exception as e:
+            print(f"  image download failed ({url[:60]}...): {e}", flush=True)
+    return False
+
+
 def gradient_card(dst: Path, seed: int):
     from PIL import Image, ImageDraw
 
@@ -568,52 +611,49 @@ def gradient_card(dst: Path, seed: int):
     img.save(dst, quality=92)
 
 
-def fetch_image(scene: dict, used: set):
-    """Pixabay photo search (PIXABAY_API_KEY). Free API images are up to 1280 px wide; if your key has
-    full-resolution access the response also carries fullHDURL / imageURL, which we prefer."""
-    import requests
-    from PIL import Image
-    from io import BytesIO
-
+def fetch_image(scene: dict, used: set, extra_queries=None) -> str:
     dst = IMG / f"{scene['id']:03d}.jpg"
     key = os.getenv("PIXABAY_API_KEY")
-    if key:
-        q = scene["visual_query"].strip()
-        for query in (q, " ".join(q.split()[:2]), "dark abstract background"):
-            try:
-                r = requests.get(
-                    "https://pixabay.com/api/",
-                    params={"key": key, "q": query[:100], "image_type": "photo", "orientation": "horizontal",
-                            "safesearch": "true", "min_width": 1280, "per_page": 20, "order": "popular"},
-                    timeout=30,
-                )
-                if r.status_code == 429:
-                    time.sleep(30)  # Pixabay: 100 requests / 60 s
-                    continue
-                r.raise_for_status()
-                hits = [h for h in r.json().get("hits", []) if h.get("largeImageURL") not in used]
-                if not hits:
-                    continue
-                h = hits[scene["id"] % min(len(hits), 8)]
-                used.add(h["largeImageURL"])
-                for url in (h.get("fullHDURL"), h.get("largeImageURL")):
-                    if not url:
-                        continue
-                    try:
-                        data = requests.get(url, timeout=60)
-                        data.raise_for_status()
-                        Image.open(BytesIO(data.content)).convert("RGB").save(dst, quality=92)
-                        return
-                    except Exception as e:
-                        print(f"  image download retry ({e})")
-            except Exception as e:
-                print(f"  pixabay failed for {query!r}: {e}")
+    if not key:
+        if not _pix["warned_nokey"]:
+            print("WARNING: PIXABAY_API_KEY is empty/not passed to this step -> gradient cards only!", flush=True)
+            _pix["warned_nokey"] = True
+        gradient_card(dst, scene["id"])
+        return "gradient:no_key"
+
+    q = (scene.get("visual_query") or "").strip()
+    i = scene["id"]
+    ladder = [(q, True), (" ".join(q.split()[:2]), True)]
+    ladder += [(x, True) for x in (extra_queries or [])]
+    ladder += [(x, True) for x in SECTION_QUERIES.get(scene.get("section", ""), [])]
+    ladder += [(GENERIC_QUERIES[i % len(GENERIC_QUERIES)], True), (GENERIC_QUERIES[(i + 3) % len(GENERIC_QUERIES)], True)]
+    ladder += [(q, False), ("abstract background", False)]
+
+    seen = set()
+    for query, strict in ladder:
+        if not query or (query, strict) in seen:
+            continue
+        seen.add((query, strict))
+        if _pix["disabled"]:
+            break
+        try:
+            hits = pixabay_search(key, query, strict)
+        except Exception as e:
+            print(f"  pixabay request failed for {query!r}: {e}", flush=True)
+            continue
+        hits = [h for h in hits if h.get("largeImageURL") not in used]
+        if not hits:
+            continue
+        pool = hits[:10]
+        for k in range(min(3, len(pool))):
+            h = pool[(i + k) % len(pool)]
+            if _download_image(h, dst):
+                used.add(h.get("largeImageURL"))
+                return f"pixabay:{query}"
     gradient_card(dst, scene["id"])
+    return f"gradient:{_pix['disabled'] or 'no_results'}"
 
 
-# --------------------------------------------------------------------------- #
-# Captions (ASS karaoke, burned in one pass)
-# --------------------------------------------------------------------------- #
 def ass_time(t: float) -> str:
     cs = int(round(max(t, 0) * 100))
     return f"{cs // 360000}:{cs // 6000 % 60:02d}:{cs // 100 % 60:02d}.{cs % 100:02d}"
@@ -666,11 +706,7 @@ def make_ass(words, W: int, H: int, short: bool, hook: str = "") -> str:
     return header + "\n".join(events) + "\n"
 
 
-# --------------------------------------------------------------------------- #
-# SFX assets (+ synthetic fallback)
-# --------------------------------------------------------------------------- #
 def synth_sfx(name: str, dst: Path):
-    """Rough FFmpeg-synthesised stand-ins. Replace with real files in assets/sfx/ for better quality."""
     TMP.mkdir(exist_ok=True)
     if name == "riser":
         src = "anoisesrc=color=pink:amplitude=1.0:duration=4:sample_rate=48000"
@@ -679,7 +715,7 @@ def synth_sfx(name: str, dst: Path):
         expr = ("(0.5*sin(2*PI*55*t)+0.35*sin(2*PI*55.8*t)+0.25*sin(2*PI*110*t)"
                 "+0.2*sin(2*PI*165*t)+0.15*sin(2*PI*220.5*t))*exp(-1.1*t)*min(1,t/0.02)")
         src, af = f"aevalsrc='{expr}':d=3:s=48000", "lowpass=f=1400,volume=0.9"
-    else:  # glitch
+    else:
         src = "anoisesrc=color=white:duration=0.4:sample_rate=48000"
         af = ("volume='if(lt(mod(t,0.08),0.04),1,0.15)':eval=frame,highpass=f=600,"
               "acrusher=bits=5:mode=log:mix=0.9,afade=t=out:st=0.3:d=0.1")
@@ -698,11 +734,7 @@ def get_sfx(name: str, i: int = 0) -> Path:
     return dst
 
 
-# --------------------------------------------------------------------------- #
-# Rendering
-# --------------------------------------------------------------------------- #
 def prep_image(src: Path, W: int, H: int, dst: Path):
-    """Cover-crop to the target aspect and upscale 2x so zoompan stays smooth (no jitter)."""
     from PIL import Image
 
     im = Image.open(src).convert("RGB")
@@ -713,12 +745,28 @@ def prep_image(src: Path, W: int, H: int, dst: Path):
     im.crop((left, top, left + tw, top + th)).save(dst, quality=92)
 
 
+def ken_burns(idx: int, n_frames: int):
+    """Smooth ease-in/out camera move, a different one per scene so the video never feels static."""
+    N = max(n_frames - 1, 1)
+    e = f"((on/{N})*(on/{N})*(3-2*on/{N}))"
+    cx, cy = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
+    mode = idx % 6
+    if mode == 0:
+        return f"1+0.2*{e}", cx, cy
+    if mode == 1:
+        return f"1.2-0.2*{e}", cx, cy
+    if mode == 2:
+        return "1.16", f"(iw-iw/zoom)*{e}", cy
+    if mode == 3:
+        return "1.16", f"(iw-iw/zoom)*(1-{e})", cy
+    if mode == 4:
+        return f"1+0.18*{e}", f"(iw-iw/zoom)*{e}", f"(ih-ih/zoom)*(1-{e})"
+    return f"1+0.18*{e}", f"(iw-iw/zoom)*(1-{e})", f"(ih-ih/zoom)*{e}"
+
+
 def render_scene(img: Path, audio: str, n_frames: int, idx: int, W: int, H: int, out: Path):
-    z = f"1+0.18*on/{n_frames}" if idx % 2 == 0 else f"1.18-0.18*on/{n_frames}"  # alternate in/out
-    vf = (
-        f"zoompan=z='{z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
-        f"d={n_frames}:s={W}x{H}:fps={FPS},format=yuv420p"
-    )
+    z, x, y = ken_burns(idx, n_frames)
+    vf = f"zoompan=z='{z}':x='{x}':y='{y}':d={n_frames}:s={W}x{H}:fps={FPS},format=yuv420p"
     sh(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         "-i", img, "-i", audio,
         "-vf", vf, "-af", "apad,aresample=48000", "-ac", "2",
@@ -728,7 +776,6 @@ def render_scene(img: Path, audio: str, n_frames: int, idx: int, W: int, H: int,
 
 
 def finalize(concat: Path, ass: Path, out: Path, events: list, silences: list):
-    """One pass: burn captions, mix narration + music (muted in silence windows) + SFX at exact times."""
     inputs = ["-i", concat]
     chains = [f"[0:v]ass={ass}[v]"]
     labels = ["[0:a]"]
@@ -747,11 +794,11 @@ def finalize(concat: Path, ass: Path, out: Path, events: list, silences: list):
         path = get_sfx(ev["kind"], k)
         length = probe_duration(path)
         f = "aformat=sample_rates=48000:channel_layouts=stereo"
-        if ev["kind"] == "riser":  # align the END of the riser with the scene cut
+        if ev["kind"] == "riser":
             d = min(length, ev["end"] - ev["start"])
             at = ev["end"] - d
             f += f",atrim=start={length - d:.3f},asetpts=PTS-STARTPTS"
-        else:  # braam / glitch hit on the scene's first frame
+        else:
             at = max(0.0, ev["start"] - (0.05 if ev["kind"] == "glitch" else 0.0))
         f += f",adelay={int(at * 1000)}:all=1,volume={SFX_GAIN[ev['kind']]}"
         inputs += ["-i", path]
@@ -790,7 +837,7 @@ def cmd_render(target: str):
     clips, words, events, silences, cursor = [], [], [], [], 0.0
     for idx, sc in enumerate(scenes):
         t = timings[sc["id"]]
-        if short and clips and cursor + t["dur"] > 58:  # keep Shorts under 60s
+        if short and clips and cursor + t["dur"] > 58:
             break
         n = max(1, round(t["dur"] * FPS))
         end = cursor + n / FPS
@@ -798,7 +845,7 @@ def cmd_render(target: str):
         prep_image(IMG / f"{sc['id']:03d}.jpg", W, H, img)
         clip = TMP / f"{target}_{idx:03d}.mp4"
         render_scene(img, t["audio"], n, idx, W, H, clip)
-        img.unlink(missing_ok=True)  # free disk early
+        img.unlink(missing_ok=True)
         for s, e, w in t["words"]:
             words.append([cursor + s, cursor + e, w])
         for kind in sc.get("sfx", []):
@@ -820,16 +867,13 @@ def cmd_render(target: str):
     finalize(concat, ass, OUT / f"{target}.mp4", events, silences)
     print(f"Rendered {target}: {cursor:.1f}s | sfx={[e['kind'] for e in events]} silences={len(silences)}")
 
-    try:  # thumbnail is a bonus: never fail the render because of it
+    try:
         import thumbnail
         thumbnail.make_for_target(target)
     except Exception as e:
         print(f"WARNING: thumbnail failed: {e}")
 
 
-# --------------------------------------------------------------------------- #
-# Prepare
-# --------------------------------------------------------------------------- #
 def cmd_prepare():
     for d in (BUILD, AUDIO, IMG):
         d.mkdir(parents=True, exist_ok=True)
@@ -851,10 +895,22 @@ def cmd_prepare():
     timings = asyncio.run(tts_all(script["scenes"]))
     (BUILD / "timings.json").write_text(json.dumps(timings, ensure_ascii=False), encoding="utf-8")
 
-    used = set()
+    used, report = set(), {}
+    extra = topic_queries(script, topic)
     for sc in script["scenes"]:
-        fetch_image(sc, used)
-        time.sleep(0.7)  # Pixabay allows 100 requests / 60 s
+        report[sc["id"]] = fetch_image(sc, used, extra)
+        time.sleep(0.3)
+    (BUILD / "img_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    real = sum(v.startswith("pixabay") for v in report.values())
+    print(f"Images: {real}/{len(report)} real photos, {len(report) - real} gradient fallbacks", flush=True)
+    for sid, src in report.items():
+        print(f"  scene {sid:>2}: {src}")
+    if real < 0.3 * len(report) and os.getenv("ALLOW_GRADIENT") != "1":
+        raise SystemExit(
+            "Too many gradient fallbacks. Check that the PIXABAY_API_KEY secret exists and is passed to the "
+            f"'prepare' step. Last Pixabay error: {_pix['disabled'] or 'none (no search results)'}. "
+            "Set ALLOW_GRADIENT=1 to ignore."
+        )
 
     dedupe.save_entry_file(dedupe.make_entry(topic, text, vec, script["title"]))
     total = sum(t["dur"] for t in timings)
