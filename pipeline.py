@@ -21,6 +21,7 @@ SFX tags (per scene, from the script's "sfx" list), files looked up in assets/sf
   braam   -> HITS at the scene's first frame (the reveal)
   glitch  -> short digital burst at the scene's first frame
   silence -> the scene gets extra tail pause and the background music is muted for that tail
+Automatic: pop -> a short tick on every 4th scene cut (matches the flash-dip transition).
 Missing files are synthesised with FFmpeg as a fallback, so the pipeline never breaks.
 """
 import argparse
@@ -39,7 +40,7 @@ import dedupe
 BUILD, OUT, TMP = Path("build"), Path("out"), Path("tmp")
 AUDIO, IMG, VID = BUILD / "audio", BUILD / "img", BUILD / "vid"
 MUSIC = Path("assets/music.mp3")  # optional background music (you must own the license)
-SFX_DIR = Path("assets/sfx")      # riser*.wav, braam*.wav, glitch*.wav (variants rotate: riser_1, riser_2 ...)
+SFX_DIR = Path("assets/sfx")      # riser*.wav, braam*.wav, glitch*.wav, pop*.wav (variants rotate)
 
 
 def env(name: str, default: str) -> str:
@@ -86,6 +87,7 @@ SFX_GAIN = {
     "riser": float(env("SFX_GAIN_RISER", "1.2")),
     "braam": float(env("SFX_GAIN_BRAAM", "0.7")),
     "glitch": float(env("SFX_GAIN_GLITCH", "0.5")),
+    "pop": float(env("SFX_GAIN_POP", "0.5")),
 }
 SFX_CAPS = {"riser": 6, "braam": 4, "glitch": 5, "silence": 4}  # per video, keeps effects meaningful
 SFX_EXT = (".wav", ".mp3", ".ogg", ".flac", ".m4a")
@@ -914,16 +916,6 @@ def check_visual_providers():
 
 
 # ---- renderers for the three asset types (each writes a clip of exactly n_frames/FPS seconds with audio) ----
-def render_video_scene(src: Path, audio: str, n_frames: int, W: int, H: int, out: Path):
-    """B-roll clip: fill the frame (cover-crop), loop if shorter than the narration, cut to the scene length."""
-    dur = n_frames / FPS
-    fc = (f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase:flags=lanczos,crop={W}:{H},"
-          f"fps={FPS},format=yuv420p[v];[1:a]apad,aresample=48000,aformat=channel_layouts=stereo[a]")
-    sh(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-stream_loop", "-1", "-i", src, "-i", audio,
-        "-filter_complex", fc, "-map", "[v]", "-map", "[a]", "-t", f"{dur:.3f}",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "aac", "-b:a", "160k", out])
-
-
 PROC_STYLES = ["waves", "mesh", "grid"]  # animated FFmpeg generators, one style per seed (rotates per scene)
 
 
@@ -987,22 +979,29 @@ def chunk_words(words, n):
 
 
 def make_ass(words, W: int, H: int, short: bool, hook: str = "") -> str:
-    fs, outline, mv = (88, 6, 520) if short else (64, 4, 70)
+    """DecodingYT-style captions: compact bottom text (safe area), white words that turn yellow as they are
+    spoken (karaoke), and a top-centre hook banner on an opaque dark box."""
+    if short:
+        fs, outline, mv, hook_mv, hook_fs = 60, 3, 380, 200, 58
+    else:
+        fs, outline, mv, hook_mv, hook_fs = 46, 3, 80, 40, 44
     header = (
         "[Script Info]\nScriptType: v4.00+\n"
-        f"PlayResX: {W}\nPlayResY: {H}\nWrapStyle: 2\n\n"
+        f"PlayResX: {W}\nPlayResY: {H}\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n"
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, "
         "Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Cap,Liberation Sans,{fs},&H0000E5FF,&H00FFFFFF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,{outline},2,2,60,60,{mv},1\n"
-        f"Style: Hook,Liberation Sans,{int(fs * 1.15)},&H0000E5FF,&H00FFFFFF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,{outline},3,8,60,60,260,1\n\n"
+        # Cap: SecondaryColour = white (not yet spoken), PrimaryColour = yellow &H0000E5FF (spoken, via \k sweep)
+        f"Style: Cap,Liberation Sans,{fs},&H0000E5FF,&H00FFFFFF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,{outline},1,2,120,120,{mv},1\n"
+        # Hook: top-centre banner, opaque dark box (BorderStyle 3), Outline = box padding
+        f"Style: Hook,Liberation Sans,{hook_fs},&H00FFFFFF,&H00FFFFFF,&H00000000,&HB4000000,-1,0,0,0,100,100,0,0,3,14,0,8,120,120,{hook_mv},1\n\n"
         "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
     events = []
     if hook:
         events.append(
-            f"Dialogue: 0,{ass_time(0)},{ass_time(3)},Hook,,0,0,0,,{{\\fad(150,150)}}{clean(hook).upper()}"
+            f"Dialogue: 0,{ass_time(0)},{ass_time(3)},Hook,,0,0,0,,{{\\fad(200,200)}}{clean(hook).upper()}"
         )
     for line in chunk_words(words, 4 if short else 6):
         parts = []
@@ -1030,6 +1029,9 @@ def synth_sfx(name: str, dst: Path):
         expr = ("(0.5*sin(2*PI*55*t)+0.35*sin(2*PI*55.8*t)+0.25*sin(2*PI*110*t)"
                 "+0.2*sin(2*PI*165*t)+0.15*sin(2*PI*220.5*t))*exp(-1.1*t)*min(1,t/0.02)")
         src, af = f"aevalsrc='{expr}':d=3:s=48000", "lowpass=f=1400,volume=0.9"
+    elif name == "pop":  # short UI-style tick at each scene cut
+        src = "sine=frequency=1200:duration=0.12:sample_rate=48000"
+        af = "afade=t=out:st=0.02:d=0.1,volume=0.8"
     else:  # glitch
         src = "anoisesrc=color=white:duration=0.4:sample_rate=48000"
         af = ("volume='if(lt(mod(t,0.08),0.04),1,0.15)':eval=frame,highpass=f=600,"
@@ -1050,20 +1052,9 @@ def get_sfx(name: str, i: int = 0) -> Path:
 
 
 # --------------------------------------------------------------------------- #
-# Rendering
+# Rendering: DecodingYT-style layered composite
+#   animated dark wave-grid background + bordered foreground card (pop-in) + flash-dip transitions
 # --------------------------------------------------------------------------- #
-def prep_image(src: Path, W: int, H: int, dst: Path):
-    """Cover-crop to the target aspect and upscale 2x so zoompan stays smooth (no jitter)."""
-    from PIL import Image
-
-    im = Image.open(src).convert("RGB")
-    tw, th = W * 2, H * 2
-    scale = max(tw / im.width, th / im.height)
-    im = im.resize((round(im.width * scale), round(im.height * scale)), Image.LANCZOS)
-    left, top = (im.width - tw) // 2, (im.height - th) // 2
-    im.crop((left, top, left + tw, top + th)).save(dst, quality=92)
-
-
 def ken_burns(idx: int, n_frames: int):
     """Smooth ease-in/out camera move, a different one per scene so the video never feels static.
     Returns zoompan (z, x, y) expressions. 0 zoom-in, 1 zoom-out, 2 pan L->R, 3 pan R->L,
@@ -1085,20 +1076,114 @@ def ken_burns(idx: int, n_frames: int):
     return f"1+0.18*{e}", f"(iw-iw/zoom)*(1-{e})", f"(ih-ih/zoom)*{e}"
 
 
+BORDER = 6            # card border (px) around each photo / B-roll clip
+CARD_BG = "0xF2F2F2"  # light border colour
+
+
+def card_geom(W: int, H: int):
+    """(card_w, card_h, card_top_y) of the foreground card. Shorts get a card in the upper-middle so the
+    bottom caption safe area (MarginV=380) and the top hook banner both stay clear."""
+    if H > W:
+        return 960, 540, 560
+    return 1440, 810, 110
+
+
+def _wave_exprs(seed: int, style: str = "grid"):
+    """lum/cb/cr expressions for FFmpeg geq. No files, no keys. Used by the animated backgrounds."""
+    rnd = random.Random(seed * 7919 + 13)
+    sp = rnd.uniform(0.6, 1.4)
+    ha, hb = rnd.uniform(0, 6.28), rnd.uniform(0, 6.28)
+    if style == "waves":
+        fx, fy = rnd.uniform(0.02, 0.05), rnd.uniform(0.02, 0.045)
+        lum = (f"36+26*sin(X*{fx:.4f}+T*{sp:.3f})*cos(Y*{fy:.4f}-T*{sp * 0.7:.3f})"
+               f"+18*sin((X+Y)*0.012+T*0.4)")
+        cb = f"128+38*sin(X*{fy:.4f}-T*{sp * 0.5:.3f}+{ha:.3f})"
+        cr = f"128+34*cos(Y*{fx:.4f}+T*{sp * 0.6:.3f}+{hb:.3f})"
+    else:  # grid: thin sweeping lines, reads as a "wave grid" when dimmed
+        ax = rnd.uniform(0.10, 0.16)
+        lum = (f"28+60*pow(0.5+0.5*cos(X*{ax:.4f}+T*{sp * 2:.3f}),40)"
+               f"+60*pow(0.5+0.5*cos(Y*{ax:.4f}-T*{sp * 1.5:.3f}),40)")
+        cb = f"120+20*sin(T*0.4+{ha:.3f})"
+        cr = f"140+20*cos(T*0.3+{hb:.3f})"
+    return lum, cb, cr
+
+
+def bg_lavfi(seed: int, dur: float, W: int, H: int) -> str:
+    """Dark, slowly moving textured canvas for the layered composite (wave grid, dimmed)."""
+    lum, cb, cr = _wave_exprs(seed, "grid")
+    return (f"nullsrc=s=480x270:r={FPS}:d={dur:.3f},geq=lum='{lum}':cb='{cb}':cr='{cr}',"
+            f"noise=alls=6:allf=t,scale={W}:{H}:flags=lanczos,"
+            f"eq=brightness=-0.22:saturation=0.85,format=yuv420p")
+
+
+def _compose_graph(fg_chain: str, idx: int, W: int, H: int) -> str:
+    """Layered composite, shared by photos and B-roll:
+      foreground = bordered card, scaled in with an ease-out pop (0.6x -> 1.0x over 0.45 s),
+      midground  = the card centred at its layout position (not full-screen),
+      background = the animated dark canvas (input [2:v]),
+      every 4th scene (idx % 4 == 0, idx > 0) starts with a white flash-dip.
+    fg_chain must end with a comma and produce the card source from input [0:v]."""
+    cw, ch, y0 = card_geom(W, H)
+    total_h = ch + 2 * BORDER
+    pop = "(0.6+0.4*(1-pow(1-min(t/0.45,1),3)))"
+    flash = "fade=t=in:st=0:d=0.22:color=white" if (idx > 0 and idx % 4 == 0) else "null"
+    return (
+        f"{fg_chain}pad={cw + 2 * BORDER}:{total_h}:{BORDER}:{BORDER}:color={CARD_BG},"
+        f"scale=w='trunc(iw*{pop}/2)*2':h='trunc(ih*{pop}/2)*2':eval=frame,"
+        f"format=yuv420p[fgp];"
+        f"[2:v]format=yuv420p[bg];"
+        f"[bg][fgp]overlay=x='(W-w)/2':y='{y0}+({total_h}-h)/2':eval=frame,"
+        f"{flash},format=yuv420p[v]"
+    )
+
+
 def render_scene(img: Path, audio: str, n_frames: int, idx: int, W: int, H: int, out: Path):
+    """Photo scene as a layered composite: animated dark background + bordered card with slow push/pull
+    (smooth ease-in-out Ken Burns), pop-in scale, and optional flash-dip transition."""
+    cw, ch, _ = card_geom(W, H)
     z, x, y = ken_burns(idx, n_frames)
     mb = ",tmix=frames=3:weights='1 2 1'" if MOTION_BLUR else ""
-    vf = f"zoompan=z='{z}':x='{x}':y='{y}':d={n_frames}:s={W}x{H}:fps={FPS}{mb},format=yuv420p"
+    fg = (f"[0:v]zoompan=z='{z}':x='{x}':y='{y}':d={n_frames}:s={cw}x{ch}:fps={FPS}{mb},"
+          f"format=yuv420p,setsar=1,")
+    dur = n_frames / FPS
     sh(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-i", img, "-i", audio,
-        "-vf", vf, "-af", "apad,aresample=48000", "-ac", "2",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-        "-c:a", "aac", "-b:a", "160k",
-        "-frames:v", n_frames, "-shortest", out])
+        "-i", img, "-i", audio, "-f", "lavfi", "-i", bg_lavfi(idx, dur, W, H),
+        "-filter_complex", _compose_graph(fg, idx, W, H), "-map", "[v]", "-map", "1:a",
+        "-af", "apad,aresample=48000,aformat=channel_layouts=stereo",
+        "-t", f"{dur:.3f}", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-c:a", "aac", "-b:a", "160k", out])
+
+
+def render_video_scene(src: Path, audio: str, n_frames: int, idx: int, W: int, H: int, out: Path):
+    """B-roll clip as the same layered composite (card + animated background), looped to the scene length."""
+    cw, ch, _ = card_geom(W, H)
+    dur = n_frames / FPS
+    fg = (f"[0:v]scale={cw}:{ch}:force_original_aspect_ratio=increase:flags=lanczos,"
+          f"crop={cw}:{ch},fps={FPS},format=yuv420p,setsar=1,")
+    sh(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-stream_loop", "-1", "-i", src,
+        "-i", audio, "-f", "lavfi", "-i", bg_lavfi(idx, dur, W, H),
+        "-filter_complex", _compose_graph(fg, idx, W, H), "-map", "[v]", "-map", "1:a",
+        "-af", "apad,aresample=48000,aformat=channel_layouts=stereo",
+        "-t", f"{dur:.3f}", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-c:a", "aac", "-b:a", "160k", out])
+
+
+def prep_image(src: Path, W: int, H: int, dst: Path):
+    """Cover-crop the photo to the CARD size, upscaled 2x so zoompan stays smooth (no jitter)."""
+    from PIL import Image
+
+    cw, ch, _ = card_geom(W, H)
+    im = Image.open(src).convert("RGB")
+    tw, th = cw * 2, ch * 2
+    scale = max(tw / im.width, th / im.height)
+    im = im.resize((round(im.width * scale), round(im.height * scale)), Image.LANCZOS)
+    left, top = (im.width - tw) // 2, (im.height - th) // 2
+    im.crop((left, top, left + tw, top + th)).save(dst, quality=92)
 
 
 def finalize(concat: Path, ass: Path, out: Path, events: list, silences: list):
-    """One pass: burn captions, mix narration + music (muted in silence windows) + SFX at exact times."""
+    """One pass: burn captions, mix narration + music (muted in silence windows) + SFX at exact times.
+    Event kinds: riser (ends at the cut), braam / glitch / pop (hit at the cut)."""
     inputs = ["-i", concat]
     chains = [f"[0:v]ass={ass}[v]"]
     labels = ["[0:a]"]
@@ -1117,13 +1202,14 @@ def finalize(concat: Path, ass: Path, out: Path, events: list, silences: list):
         path = get_sfx(ev["kind"], k)
         length = probe_duration(path)
         f = "aformat=sample_rates=48000:channel_layouts=stereo"
-        if ev["kind"] == "riser":  # align the END of the riser with the scene cut
+        if ev["kind"] == "riser":  # the END of the riser lands on the scene cut
             d = min(length, ev["end"] - ev["start"])
             at = ev["end"] - d
             f += f",atrim=start={length - d:.3f},asetpts=PTS-STARTPTS"
-        else:  # braam / glitch hit on the scene's first frame
+        else:  # braam / glitch / pop hit on the scene's first frame
             at = max(0.0, ev["start"] - (0.05 if ev["kind"] == "glitch" else 0.0))
-        f += f",adelay={int(at * 1000)}:all=1,volume={SFX_GAIN[ev['kind']]}"
+        gain = SFX_GAIN.get(ev["kind"], 0.5)
+        f += f",adelay={int(at * 1000)}:all=1,volume={gain}"
         inputs += ["-i", path]
         chains.append(f"[{idx}:a]{f}[x{k}]")
         labels.append(f"[x{k}]")
@@ -1176,7 +1262,7 @@ def cmd_render(target: str):
             asset = {"type": "procedural"}
         kinds[asset["type"]] += 1
         if asset["type"] == "video":
-            render_video_scene(BUILD / asset["path"], t["audio"], n, W, H, clip)
+            render_video_scene(BUILD / asset["path"], t["audio"], n, idx, W, H, clip)
         elif asset["type"] == "image":
             img = TMP / f"{target}_{idx:03d}.jpg"
             prep_image(BUILD / asset["path"], W, H, img)
@@ -1192,6 +1278,8 @@ def cmd_render(target: str):
                 silences.append((end - t.get("pad", PAD), end))
             else:
                 events.append({"kind": kind, "start": cursor, "end": end})
+        if idx > 0 and idx % 4 == 0:  # flash-dip transition every 4th scene: pop SFX on the cut
+            events.append({"kind": "pop", "start": cursor, "end": end})
         clips.append(clip.resolve())
         cursor = end
 
