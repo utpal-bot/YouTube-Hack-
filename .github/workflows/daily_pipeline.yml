@@ -35,6 +35,11 @@ env:
   LLM_FAST_MODEL: ${{ vars.LLM_FAST_MODEL }}  # default: openai/gpt-oss-20b
   LLM_TPM: ${{ vars.LLM_TPM }}                # your tokens-per-minute budget (default 7500)
   WRITE_PARTS: ${{ vars.WRITE_PARTS }}        # 2 = plan + 2 write calls; use 3-4 if you hit 413/429
+  # Zero-key visuals (no stock-photo API keys needed)
+  VISUAL_PROVIDERS: ${{ vars.VISUAL_PROVIDERS }}  # default: wikimedia,openverse,nasa
+  BROLL_EVERY: ${{ vars.BROLL_EVERY }}            # default: 3 (every 3rd scene tries a B-roll clip)
+  MOTION_BLUR: ${{ vars.MOTION_BLUR }}            # default: 1 (set 0 to disable)
+  WIKI_CONTACT: ${{ vars.WIKI_CONTACT }}          # contact email or repo URL for Wikimedia's User-Agent
 
 jobs:
   prepare:
@@ -72,10 +77,9 @@ jobs:
           echo "Models available to this key:"; echo "$IDS"
           echo "$IDS" | grep -qx "$WANT" || echo "::warning::$WANT is not in your model list; pipeline will try its fallbacks"
 
-      - name: Topic -> script -> voice -> images
+      - name: Topic -> script -> voice -> visuals (zero stock-API keys)
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
         run: python pipeline.py prepare
 
       - uses: actions/upload-artifact@v4
